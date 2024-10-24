@@ -38,7 +38,8 @@ class BitsAndBytesConfig(QuantizationConfig):
         self.llm_int8_threshold = llm_int8_threshold
 
     def __repr__(self) -> str:
-        return "BitsAndBytesConfig"
+        return (f"BitsAndBytesConfig"
+                f"(llm_int8_skip_modules={self.llm_int8_skip_modules})")
 
     @classmethod
     def get_name(self) -> str:
@@ -282,6 +283,10 @@ class BitsAndBytesLinearMethod(LinearMethodBase):
         from bitsandbytes import matmul_4bit
 
         original_type = x.dtype
+        bs = None
+        if x.ndim == 3:
+            bs = x.size(0)
+            x = x.reshape(-1, x.size(-1))
         bf_x = x.to(torch.bfloat16)
 
         qweight = layer.qweight
@@ -309,6 +314,9 @@ class BitsAndBytesLinearMethod(LinearMethodBase):
             current_index += output_size
 
         out = out.to(original_type)
+
+        if bs is not None:
+            out = out.view(bs, -1, out.size(-1))
 
         if bias is not None:
             out += bias

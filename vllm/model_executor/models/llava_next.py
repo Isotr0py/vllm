@@ -274,6 +274,8 @@ class LlavaNextForConditionalGeneration(nn.Module, SupportsMultiModal,
         ".k_proj.",
         ".v_proj.",
         ".o_proj.",
+        ".fc1.",
+        ".fc2.",
     ]
     # in TP, these weights are partitioned along the column dimension (dim=-1)
     column_parallel_weights_modules = [".down_proj.", ".o_proj."]
