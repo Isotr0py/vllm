@@ -171,7 +171,12 @@ class GGUFLinearMethod(LinearMethodBase):
             for idx in shard_id:
                 q_idx = layer.qweight.shard_id_map[idx]
                 qweight_type = layer.qweight_type.shard_weight_type[idx]
-                result.append(_fuse_mul_mat(x, qweight[q_idx], qweight_type))
+                sub_out = _fuse_mul_mat(x, qweight[q_idx], qweight_type)
+                result.append(sub_out)
+                if torch.isnan(sub_out).any():
+                    torch.save(qweight[q_idx], f"bug_qweight_type{qweight_type}.pt")
+                    torch.save(x, "bug_x.pt")
+                    raise ValueError("NaN detected in GGUF linear layer.")
             out = torch.cat(result, axis=1)
         else:
             qweight = layer.qweight
