@@ -194,8 +194,26 @@ class ViTAttention(Attention):
         assert attn_type == AttentionType.ENCODER_ONLY, (
             "ViTAttention can only use ENCODER_ONLY attn_type")
         kv_cache = torch.tensor([], dtype=torch.float32, device=query.device)
-        return torch.ops.vllm.unified_attention(query, key, value, kv_cache,
-                                                attn_type, self.layer_name)
+        if self.use_output:
+            output = torch.empty_like(query)
+            hidden_size = query.size(-1)
+            # Reshape the query, key, and value tensors.
+            # NOTE(woosuk): We do this outside the custom op to minimize the
+            # CPU overheads from the non-CUDA-graph regions.
+            query = query.view(-1, self.num_heads, self.head_size)
+            output = output.view(-1, self.num_heads, self.head_size)
+            if key is not None:
+                key = key.view(-1, self.num_kv_heads, self.head_size)
+            if value is not None:
+                value = value.view(-1, self.num_kv_heads, self.head_size)
+            torch.ops.vllm.unified_attention_with_output(
+                query, key, value, output, kv_cache, attn_type,
+                self.layer_name)
+            return output.view(-1, hidden_size)
+        else:
+            return torch.ops.vllm.unified_attention(query, key, value,
+                                                    kv_cache, attn_type,
+                                                    self.layer_name)
 
 
 def unified_attention(
