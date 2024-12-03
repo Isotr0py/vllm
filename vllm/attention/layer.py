@@ -168,6 +168,36 @@ class Attention(nn.Module):
         return s
 
 
+class ViTAttention(Attention):
+
+    def __init__(
+        self,
+        num_heads: int,
+        head_size: int,
+        scale: float,
+        prefix: str = "",
+    ):
+        super().__init__(num_heads=num_heads,
+                         head_size=head_size,
+                         scale=scale,
+                         prefix=prefix)
+
+    def forward(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        kv_cache: Optional[torch.Tensor] = None,
+        attn_metadata: Optional[AttentionMetadata] = None,
+        attn_type: str = AttentionType.ENCODER_ONLY,
+    ) -> torch.Tensor:
+        assert attn_type == AttentionType.ENCODER_ONLY, (
+            "ViTAttention can only use ENCODER_ONLY attn_type")
+        kv_cache = torch.tensor([], dtype=torch.float32, device=query.device)
+        return torch.ops.vllm.unified_attention(query, key, value, kv_cache,
+                                                attn_type, self.layer_name)
+
+
 def unified_attention(
     query: torch.Tensor,
     key: torch.Tensor,
