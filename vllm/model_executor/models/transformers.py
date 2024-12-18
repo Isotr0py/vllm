@@ -71,6 +71,8 @@ def vllm_flash_attention_forward(
 ALL_ATTENTION_FUNCTIONS["vllm"] = vllm_flash_attention_forward
 
 
+# Linear Layer that is compatiable with transformers internal forward
+# TODO: This is a temporary solution, we should find a better way to intergrate
 class HFColumnParallelLinear(ColumnParallelLinear):
     def forward(self, input: torch.Tensor) -> torch.Tensor:
         return super().forward(input)[0]
@@ -133,12 +135,13 @@ class TransformersModel(nn.Module):
         self.model = AutoModel.from_config(config)
         self.tensor_parallelize(self.model)
 
-        self.model.embed_tokens = VocabParallelEmbedding(
-            self.vocab_size,
-            config.hidden_size,
-            org_num_embeddings=config.vocab_size,
-            quant_config=None,
-        )
+        # TODO(Isotr0py): Find a better method to parallelize VocabEmbedding
+        # self.model.embed_tokens = VocabParallelEmbedding(
+        #     self.vocab_size,
+        #     config.hidden_size,
+        #     org_num_embeddings=config.vocab_size,
+        #     quant_config=None,
+        # )
         self.lm_head = ParallelLMHead(config.vocab_size,
                                       config.hidden_size,
                                       quant_config=None,
