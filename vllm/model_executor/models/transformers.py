@@ -19,6 +19,7 @@ from typing import Dict, Iterable, List, Optional, Set, Tuple, TypedDict, Union
 import torch
 from torch import nn
 from transformers import AutoModel
+from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 
 from vllm.attention import Attention, AttentionMetadata
 from vllm.config import VllmConfig
@@ -27,11 +28,12 @@ from vllm.model_executor.layers.linear import (ColumnParallelLinear,
                                                RowParallelLinear)
 from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 from vllm.model_executor.layers.sampler import SamplerOutput, get_sampler
+from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.sampling_metadata import SamplingMetadata
 from vllm.sequence import IntermediateTensors
 
 
-from .utils import AutoWeightsLoader, maybe_prefix
+from .utils import maybe_prefix
 
 
 class VllmKwargsForCausalLM(TypedDict, total=False):
@@ -66,6 +68,15 @@ def vllm_flash_attention_forward(
 ALL_ATTENTION_FUNCTIONS["vllm"] = vllm_flash_attention_forward
 
 
+class HFColumnParallelLinear(ColumnParallelLinear):
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        return super().forward(input)[0]
+
+class HFRowParallelLinear(RowParallelLinear):
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        return super().forward(input)[0]
+
+
 def replace_tp_linear_class(orig_module: nn.Linear, style: str):
     """
     In model configurations, we use a neutral type (string) to specify parallel
@@ -80,9 +91,9 @@ def replace_tp_linear_class(orig_module: nn.Linear, style: str):
     bias = orig_module.bias is not None
 
     if style == "colwise":
-        return ColumnParallelLinear(input_size, output_size, bias)
+        return HFColumnParallelLinear(input_size, output_size, bias)
     elif style == "rowwise":
-        return RowParallelLinear(input_size, output_size, bias)
+        return HFRowParallelLinear(input_size, output_size, bias)
     # We don't consider colwise_rep since it's used in lm_head
     else:
         raise ValueError(f"Unsupported parallel style value: {style}")
@@ -104,10 +115,6 @@ class TransformersModel(nn.Module):
         self.vocab_size = config.vocab_size
         self.unpadded_vocab_size = config.vocab_size
 
-        self.tp_plan = self.config.base_model_tp_plan
-        self.model = AutoModel.from_config(vllm_config)
-        self.tensor_parallelize(self.model)
-
         self.attention_interface = Attention(
             config.num_attention_heads,
             config.head_dim,
@@ -118,21 +125,24 @@ class TransformersModel(nn.Module):
         )
         config._attn_implementation_internal="vllm"
 
+        self.tp_plan = self.config.base_model_tp_plan
+        self.model = AutoModel.from_config(config)
+        self.tensor_parallelize(self.model)
+
+        self.lm_head = ParallelLMHead(config.vocab_size,
+                                      config.hidden_size,
+                                      quant_config=None,
+                                      prefix=maybe_prefix(
+                                          prefix, "lm_head"))
         if config.tie_word_embeddings:
-            self.lm_head = self.model.embed_tokens
-        else:
-            self.lm_head = ParallelLMHead(config.vocab_size,
-                                          config.hidden_size,
-                                          quant_config=None,
-                                          prefix=maybe_prefix(
-                                              prefix, "lm_head"))
+            self.lm_head.weight = self.model.get_input_embeddings().weight
 
         logit_scale = getattr(config, "logit_scale", 1.0)
         self.logits_processor = LogitsProcessor(self.unpadded_vocab_size,
                                                 config.vocab_size,
                                                 logit_scale)
         self.sampler = get_sampler()
-    
+
 
     def tensor_parallelize(self, module: nn.Module, prefix: str =""):
         for child_name, child_module in module.named_children():
@@ -165,7 +175,12 @@ class TransformersModel(nn.Module):
         intermediate_tensors: Optional[IntermediateTensors] = None,
     ) -> Union[torch.Tensor, IntermediateTensors]:
         model_output = self.model(
-            input_ids[None,...], use_cache=False, position_ids=positions[None,...], kv_caches=kv_caches, attn_metadata=attn_metadata, intermediate_tensors=intermediate_tensors, attention_interface = self.attention_interface.forward, return_dict=False
+            input_ids[None,...], use_cache=False, 
+            position_ids=positions[None,...],
+            kv_caches=kv_caches, attn_metadata=attn_metadata,
+            intermediate_tensors=intermediate_tensors,
+            attention_interface = self.attention_interface.forward, 
+            return_dict=False
         )[0][0,...] # we remove batch dimension for now
         return model_output
 
@@ -174,7 +189,7 @@ class TransformersModel(nn.Module):
         hidden_states: torch.Tensor,
         sampling_metadata: SamplingMetadata,
     ) -> Optional[torch.Tensor]:
-        logits = self.logits_processor(self.model.lm_head, hidden_states,
+        logits = self.logits_processor(self.lm_head, hidden_states,
                                        sampling_metadata)
         return logits
 
@@ -186,9 +201,12 @@ class TransformersModel(nn.Module):
     
     def load_weights(self, weights: Iterable[Tuple[str,
                                                    torch.Tensor]]) -> Set[str]:
-        loader = AutoWeightsLoader(
-            self,
-            skip_prefixes=(["lm_head."]
-                           if self.config.tie_word_embeddings else None),
-        )
-        return loader.load_weights(weights)
+        params_dict = dict(self.named_parameters())
+        loaded_params: Set[str] = set()
+        for name, loaded_weight in weights:
+            param = params_dict[name]
+            weight_loader = getattr(param, "weight_loader",
+                                    default_weight_loader)
+            weight_loader(param, loaded_weight)
+            loaded_params.add(name)
+        return loaded_params
