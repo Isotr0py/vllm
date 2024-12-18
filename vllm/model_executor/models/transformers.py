@@ -23,10 +23,12 @@ from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 
 from vllm.attention import Attention, AttentionMetadata
 from vllm.config import VllmConfig
+from vllm.distributed import get_tensor_model_parallel_world_size
+from vllm.distributed.utils import divide
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.linear import (ColumnParallelLinear,
                                                RowParallelLinear)
-from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
+from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmbedding, ParallelLMHead
 from vllm.model_executor.layers.sampler import SamplerOutput, get_sampler
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.sampling_metadata import SamplingMetadata
@@ -62,7 +64,8 @@ def vllm_flash_attention_forward(
     layer_idx = _module.layer_idx
     hidden = query.shape[-2]
     query, key, value = [x.transpose(1,2) for x in (query, key, value)]
-    return attention_interface(query.reshape(hidden,-1), key.reshape(hidden,-1), value.reshape(hidden,-1), kv_cache=kv_caches[layer_idx],attn_metadata=attn_metadata), None
+    query, key, value = [x.reshape(hidden,-1) for x in (query, key, value)]
+    return attention_interface(query, key, value, kv_cache=kv_caches[layer_idx],attn_metadata=attn_metadata), None
 
 
 ALL_ATTENTION_FUNCTIONS["vllm"] = vllm_flash_attention_forward
@@ -115,11 +118,12 @@ class TransformersModel(nn.Module):
         self.vocab_size = config.vocab_size
         self.unpadded_vocab_size = config.vocab_size
 
+        self.tp_size = get_tensor_model_parallel_world_size()
         self.attention_interface = Attention(
-            config.num_attention_heads,
+            divide(config.num_attention_heads, self.tp_size),
             config.head_dim,
             config.head_dim**-0.5, # ish, the sacling is different for every attn layer
-            num_kv_heads=config.num_key_value_heads,
+            num_kv_heads=divide(config.num_key_value_heads, self.tp_size),
             cache_config=vllm_config.cache_config,
             quant_config=vllm_config.quant_config,
         )
@@ -129,6 +133,12 @@ class TransformersModel(nn.Module):
         self.model = AutoModel.from_config(config)
         self.tensor_parallelize(self.model)
 
+        self.model.embed_tokens = VocabParallelEmbedding(
+            self.vocab_size,
+            config.hidden_size,
+            org_num_embeddings=config.vocab_size,
+            quant_config=None,
+        )
         self.lm_head = ParallelLMHead(config.vocab_size,
                                       config.hidden_size,
                                       quant_config=None,
