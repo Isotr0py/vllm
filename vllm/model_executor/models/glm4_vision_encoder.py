@@ -175,8 +175,8 @@ class GLU(nn.Module):
 
     def __init__(
         self,
-        config,
-        in_features,
+        hidden_size: int,
+        ffn_hidden_size: int,
         quant_config: Optional[QuantizationConfig] = None,
     ):
         """
@@ -216,21 +216,21 @@ class GLU(nn.Module):
         ```
         """
         super().__init__()
-        self.linear_proj = ReplicatedLinear(in_features,
-                                            config.hidden_size,
+        self.linear_proj = ReplicatedLinear(hidden_size,
+                                            hidden_size,
                                             bias=False,
                                             quant_config=quant_config)
-        self.norm1 = nn.LayerNorm(config.hidden_size)
+        self.norm1 = nn.LayerNorm(hidden_size)
         self.act1 = nn.GELU()
         self.act2 = SiluAndMul()
 
         self.merged_proj = MergedColumnParallelLinear(
-            config.hidden_size, [config.ffn_hidden_size] * 2,
+            hidden_size, [ffn_hidden_size] * 2,
             bias=False,
             quant_config=quant_config)
 
-        self.dense_4h_to_h = RowParallelLinear(config.ffn_hidden_size,
-                                               config.hidden_size,
+        self.dense_4h_to_h = RowParallelLinear(ffn_hidden_size,
+                                               hidden_size,
                                                bias=False,
                                                quant_config=quant_config)
 
@@ -257,8 +257,8 @@ class EVA2CLIPModel(nn.Module):
         self.transformer = Transformer(vision_config,
                                        quant_config=quant_config,
                                        prefix=f"{prefix}.transformer")
-        self.linear_proj = GLU(config,
-                               in_features=config.hidden_size,
+        self.linear_proj = GLU(hidden_size=config.hidden_size,
+                               ffn_hidden_size=config.ffn_hidden_size,
                                quant_config=quant_config)
         self.conv = nn.Conv2d(in_channels=vision_config.hidden_size,
                               out_channels=config.hidden_size,
