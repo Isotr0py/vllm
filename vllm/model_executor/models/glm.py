@@ -1,14 +1,17 @@
 """Inference-only HF format GLM-4 model compatible with THUDM weights."""
-from typing import Optional
+from typing import Optional, List, Union
 
 import torch
 import torch.nn as nn
 from transformers import PretrainedConfig
 
+from vllm.attention import AttentionMetadata
 from vllm.config import VllmConfig, QuantizationConfig
+from vllm.model_executor.layers.sampler import SamplerOutput
 from vllm.model_executor.models.llama import LlamaForCausalLM
 from vllm.model_executor.models.glm4_vision_encoder import GLU
 from vllm.model_executor.models.siglip import SiglipEncoder
+from vllm.sequence import IntermediateTensors
 
 from .utils import PPMissingLayer
 
@@ -93,9 +96,22 @@ class GlmForCausalLM(LlamaForCausalLM):
         config = vllm_config.model_config.hf_config
         quant_config = vllm_config.quant_config
         # Initialize VL
-        if hasattr(config, "vision_config"):
+        self.is_vision = hasattr(config, "vision_config")
+        if self.is_vision:
             self.vision = VisionModel(
                 config=config,
                 quant_config=quant_config,
                 prefix="vision",
             )
+    
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        kv_caches: List[torch.Tensor],
+        attn_metadata: AttentionMetadata,
+        intermediate_tensors: Optional[IntermediateTensors] = None,
+        inputs_embeds: Optional[torch.Tensor] = None,
+        **kwargs: object,
+    ) -> Union[SamplerOutput, IntermediateTensors]:
+        pass
