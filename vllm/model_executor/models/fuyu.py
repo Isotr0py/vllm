@@ -139,17 +139,17 @@ class FuyuMultiModalProcessor(BaseMultiModalProcessor):
         mm_data = dict(mm_data)
         images = mm_data.pop("images", [])
 
-        if mm_data and images:
+        if images:
             processed_outputs = self._fuyu_image_preprocess(images)
             pixel_values = torch.cat([
                 image_patch[0]
                 for image_patch in processed_outputs.pop("image_patches")
-            ])
+            ]).unsqueeze(0)
             image_input_ids = processed_outputs.pop(
                 "image_input_ids")[0][0].tolist()
-            input_ids = torch.stack([prompt_ids + image_input_ids])
+            input_ids = torch.tensor([prompt_ids + image_input_ids])
             processed_outputs = dict(input_ids=input_ids,
-                                     image_input_ids=image_input_ids,
+                                     image_input_ids=[image_input_ids],
                                      pixel_values=pixel_values)
             return BatchFeature(data=processed_outputs, tensor_type="pt")
         else:
@@ -160,7 +160,10 @@ class FuyuMultiModalProcessor(BaseMultiModalProcessor):
         hf_inputs: BatchFeature,
         hf_processor_mm_kwargs: Mapping[str, object],
     ) -> Mapping[str, MultiModalFieldConfig]:
-        return dict(pixel_values=MultiModalFieldConfig.batched("image"))
+        return dict(
+            pixel_values=MultiModalFieldConfig.batched("image"),
+            image_input_ids=MultiModalFieldConfig.batched("image"),
+        )
 
     def _get_prompt_replacements(
         self,
@@ -168,7 +171,9 @@ class FuyuMultiModalProcessor(BaseMultiModalProcessor):
         hf_processor_mm_kwargs: Mapping[str, object],
         out_mm_kwargs: MultiModalKwargs,
     ) -> list[PromptReplacement]:
-        image_input_ids = out_mm_kwargs.get("image_input_ids")
+        image_input_ids = out_mm_kwargs.get("image_input_ids", [])
+        if isinstance(image_input_ids, torch.Tensor):
+            image_input_ids = image_input_ids.squeeze(0).tolist()
         return [
             PromptReplacement(
                 modality="image",
@@ -184,9 +189,10 @@ class FuyuMultiModalProcessor(BaseMultiModalProcessor):
             (MAX_IMAGE_FEATURE_SIZE_WIDTH, MAX_IMAGE_FEATURE_SIZE_HEIGHT),
             color=0,
         )
+        mm_data = dict(image=image if num_images == 1 else [image] * num_images)
         return ProcessorInputs(
             prompt_text="",
-            mm_data=dict(images=[image] * num_images),
+            mm_data=mm_data,
         )
 
 
