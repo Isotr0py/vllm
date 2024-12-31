@@ -147,7 +147,7 @@ class FuyuMultiModalProcessor(BaseMultiModalProcessor):
             ]).unsqueeze(0)
             image_input_ids = processed_outputs.pop(
                 "image_input_ids")[0][0].tolist()
-            input_ids = torch.tensor([prompt_ids + image_input_ids])
+            input_ids = torch.tensor([image_input_ids + prompt_ids])
             processed_outputs = dict(input_ids=input_ids,
                                      image_input_ids=[image_input_ids],
                                      pixel_values=pixel_values)
@@ -189,7 +189,8 @@ class FuyuMultiModalProcessor(BaseMultiModalProcessor):
             (MAX_IMAGE_FEATURE_SIZE_WIDTH, MAX_IMAGE_FEATURE_SIZE_HEIGHT),
             color=0,
         )
-        mm_data = dict(image=image if num_images == 1 else [image] * num_images)
+        mm_data = dict(image=image if num_images == 1 else [image] *
+                       num_images)
         return ProcessorInputs(
             prompt_text="",
             mm_data=mm_data,
