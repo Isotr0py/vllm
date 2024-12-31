@@ -129,10 +129,14 @@ class FuyuMultiModalProcessor(BaseMultiModalProcessor):
         mm_kwargs: Mapping[str, object],
     ) -> BatchFeature:
         tokenizer = self._get_tokenizer()
+        bos_token = tokenizer.encode("<s>", add_special_tokens=False)[1:]
+        boa_token = tokenizer.encode("\x04", add_special_tokens=False)[1:]
+
         prompt_ids = tokenizer.encode(
-            "<s>" + prompt + "\x04",
+            prompt,
             add_special_tokens=False,  # type: ignore
         )
+        prompt_ids = bos_token + prompt_ids + boa_token
 
         # To get image_input_ids for placeholder replacement, we don't call
         # processor directly, but call _fuyu_image_preprocess instead.
