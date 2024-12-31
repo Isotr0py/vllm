@@ -130,7 +130,7 @@ class FuyuMultiModalProcessor(BaseMultiModalProcessor):
     ) -> BatchFeature:
         tokenizer = self._get_tokenizer()
         prompt_ids = tokenizer.encode(
-            prompt,
+            "<s>" + prompt + "\x04",
             add_special_tokens=False,  # type: ignore
         )
 
@@ -147,7 +147,7 @@ class FuyuMultiModalProcessor(BaseMultiModalProcessor):
             ]).unsqueeze(0)
             image_input_ids = processed_outputs.pop(
                 "image_input_ids")[0][0].tolist()
-            input_ids = torch.tensor([image_input_ids + prompt_ids])
+            input_ids = torch.tensor([prompt_ids + image_input_ids])
             processed_outputs = dict(input_ids=input_ids,
                                      image_input_ids=[image_input_ids],
                                      pixel_values=pixel_values)
