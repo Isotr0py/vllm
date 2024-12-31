@@ -22,7 +22,7 @@ import torch
 import torch.nn as nn
 import torch.utils.checkpoint
 from PIL import Image
-from transformers import BatchFeature, FuyuImageProcessor, FuyuProcessor
+from transformers import BatchFeature, FuyuProcessor
 
 from vllm.attention import AttentionMetadata
 from vllm.config import VllmConfig
@@ -45,7 +45,6 @@ from .utils import (AutoWeightsLoader, flatten_bn, maybe_prefix,
 
 # Cannot find the following 2 numbers from hf config.
 _IMAGE_TOKEN_ID = 71011
-_NEWLINE_TOKEN_ID = 71019
 
 MAX_IMAGE_FEATURE_SIZE_HEIGHT = 1080
 MAX_IMAGE_FEATURE_SIZE_WIDTH = 1920
@@ -97,67 +96,26 @@ class FuyuMultiModalProcessor(BaseMultiModalProcessor):
     def _get_hf_processor(self) -> FuyuProcessor:
         return self.ctx.get_hf_processor(FuyuProcessor)
 
-    def _fuyu_image_preprocess(self, data: List[Image.Image]) -> BatchFeature:
-        hf_processor = self._get_hf_processor()
-        image_processor: FuyuImageProcessor = hf_processor.image_processor
-
-        image_encoding = image_processor.preprocess(data, return_tensors="pt")
-        batch_images = torch.stack(
-            [img[0] for img in image_encoding["images"]]).unsqueeze(1)
-        image_unpadded_heights = torch.tensor(
-            image_encoding["image_unpadded_heights"])
-        image_unpadded_widths = torch.tensor(
-            image_encoding["image_unpadded_widths"])
-
-        batch_size = len(image_encoding["images"])
-        image_present = torch.ones(batch_size, 1, 1)
-        model_image_input = image_processor.preprocess_with_tokenizer_info(
-            image_input=batch_images,
-            image_present=image_present,
-            image_unpadded_h=image_unpadded_heights,
-            image_unpadded_w=image_unpadded_widths,
-            image_placeholder_id=_IMAGE_TOKEN_ID,
-            image_newline_id=_NEWLINE_TOKEN_ID,
-            variable_sized=True,
-        )
-        return model_image_input
-
     def _call_hf_processor(
         self,
         prompt: str,
         mm_data: Mapping[str, object],
         mm_kwargs: Mapping[str, object],
     ) -> BatchFeature:
-        tokenizer = self._get_tokenizer()
-        bos_token = tokenizer.encode("<s>", add_special_tokens=False)[1:]
-        boa_token = tokenizer.encode("\x04", add_special_tokens=False)[1:]
-
-        prompt_ids = tokenizer.encode(
-            prompt,
-            add_special_tokens=False,  # type: ignore
-        )
-        prompt_ids = bos_token + prompt_ids + boa_token
-
         # To get image_input_ids for placeholder replacement, we don't call
         # processor directly, but call _fuyu_image_preprocess instead.
-        mm_data = dict(mm_data)
-        images = mm_data.pop("images", [])
-
-        if images:
-            processed_outputs = self._fuyu_image_preprocess(images)
-            pixel_values = torch.cat([
-                image_patch[0]
-                for image_patch in processed_outputs.pop("image_patches")
-            ]).unsqueeze(0)
-            image_input_ids = processed_outputs.pop(
-                "image_input_ids")[0][0].tolist()
-            input_ids = torch.tensor([prompt_ids + image_input_ids])
-            processed_outputs = dict(input_ids=input_ids,
-                                     image_input_ids=[image_input_ids],
-                                     pixel_values=pixel_values)
-            return BatchFeature(data=processed_outputs, tensor_type="pt")
-        else:
-            return BatchFeature(dict(input_ids=[prompt_ids]), tensor_type="pt")
+        processed_outputs = super()._call_hf_processor(prompt, mm_data,
+                                                       mm_kwargs)
+        if "image_patches" in processed_outputs:
+            tokenizer = self._get_tokenizer()
+            new_prompt = tokenizer.decode(processed_outputs["input_ids"][0])
+            image_prompt = new_prompt.split("<s>")[0]
+            image_input_ids = tokenizer.encode(image_prompt,
+                                               return_tensors="pt")
+            processed_outputs["image_input_ids"] = image_input_ids
+            processed_outputs["pixel_values"] = processed_outputs.pop(
+                "image_patches")
+        return processed_outputs
 
     def _get_mm_fields_config(
         self,
