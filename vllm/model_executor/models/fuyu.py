@@ -102,19 +102,27 @@ class FuyuMultiModalProcessor(BaseMultiModalProcessor):
         mm_data: Mapping[str, object],
         mm_kwargs: Mapping[str, object],
     ) -> BatchFeature:
-        # To get image_input_ids for placeholder replacement, we don't call
-        # processor directly, but call _fuyu_image_preprocess instead.
+        tokenizer = self._get_tokenizer()
         processed_outputs = super()._call_hf_processor(prompt, mm_data,
                                                        mm_kwargs)
         if "image_patches" in processed_outputs:
-            tokenizer = self._get_tokenizer()
-            new_prompt = tokenizer.decode(processed_outputs["input_ids"][0])
+            new_prompt = tokenizer.decode(processed_outputs["input_ids"][0],
+                                          skip_special_tokens=True)
             image_prompt = new_prompt.split("<s>")[0]
             image_input_ids = tokenizer.encode(image_prompt,
                                                return_tensors="pt")
             processed_outputs["image_input_ids"] = image_input_ids
             processed_outputs["pixel_values"] = processed_outputs.pop(
                 "image_patches")
+        else:
+            bos_token = tokenizer.encode("<s>", add_special_tokens=False)[1:]
+            boa_token = tokenizer.encode("\x04", add_special_tokens=False)[1:]
+            prompt_ids = tokenizer.encode(
+                prompt,
+                add_special_tokens=False,  # type: ignore
+            )
+            prompt_ids = bos_token + prompt_ids + boa_token
+            processed_outputs["input_ids"] = torch.tensor([prompt_ids])
         return processed_outputs
 
     def _get_mm_fields_config(
