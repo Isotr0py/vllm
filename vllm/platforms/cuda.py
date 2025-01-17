@@ -175,9 +175,6 @@ class CudaPlatformBase(Platform):
     @classmethod
     def get_attn_backend_cls(cls, selected_backend, head_size, dtype,
                              kv_cache_dtype, block_size, use_v1) -> str:
-        if use_v1:
-            logger.info("Using Flash Attention backend on V1 engine.")
-            return "vllm.v1.attention.backends.flash_attn.FlashAttentionBackend"
         if selected_backend == _Backend.FLASHINFER:
             logger.info("Using FlashInfer backend.")
             return "vllm.attention.backends.flashinfer.FlashInferBackend"
@@ -239,6 +236,13 @@ class CudaPlatformBase(Platform):
                     "Make sure that vllm_flash_attn was built and installed "
                     "(on by default).")
                 target_backend = _Backend.XFORMERS
+
+        if use_v1 and target_backend == _Backend.FLASH_ATTN:
+            logger.info("Using Flash Attention backend on V1 engine.")
+            return "vllm.v1.attention.backends.flash_attn.FlashAttentionBackend"
+        elif use_v1 and target_backend == _Backend.XFORMERS:
+            logger.info("Using XFormers backend on V1 engine.")
+            return "vllm.v1.attention.backends.xformers.XFormersBackend"
 
         if target_backend == _Backend.XFORMERS:
             logger.info("Using XFormers backend.")
