@@ -154,7 +154,6 @@ class XFormersImpl(AttentionImpl[XFormersMetadata]):
         attn_metadata: XFormersMetadata,
         k_scale: float = 1.0,
         v_scale: float = 1.0,
-        output: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Forward pass with Xformers.
 
@@ -168,13 +167,11 @@ class XFormersImpl(AttentionImpl[XFormersMetadata]):
             shape = [num_tokens, num_heads * head_size]
         """
         assert k_scale == 1.0 and v_scale == 1.0, (
-            "key/v_scale is not supported in FlashAttention.")
-
-        assert output is not None, "Output tensor must be provided."
-
+            "key/v_scale is not supported in XformersAttention.")
+        
         if attn_metadata is None:
-            # Profiling run.
-            return output
+            shape = (query.size(0), self.num_heads * self.head_size)
+            return torch.zeros(shape, device=query.device)
 
         # IMPORTANT!
         # NOTE(woosuk): With piece-wise CUDA graphs, this method is executed in
@@ -200,11 +197,11 @@ class XFormersImpl(AttentionImpl[XFormersMetadata]):
             v_scale,
         )
         attn_bias = BlockDiagonalMask.from_seqlens([num_actual_tokens])
-        output[:num_actual_tokens] = xops.memory_efficient_attention_forward(
-                query[:num_actual_tokens].unsqueeze(0),
-                key.unsqueeze(0),
-                value.unsqueeze(0),
-                attn_bias=attn_bias[0],
-                p=0.0,
-                scale=self.scale)
+        output = xops.memory_efficient_attention_forward(
+            query[:num_actual_tokens].unsqueeze(0),
+            key.unsqueeze(0),
+            value.unsqueeze(0),
+            attn_bias=attn_bias[0],
+            p=0.0,
+            scale=self.scale)
         return output
