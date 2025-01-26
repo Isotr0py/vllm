@@ -35,8 +35,10 @@ from transformers.models.qwen2_vl import (Qwen2VLImageProcessor,
 from transformers.models.qwen2_vl.configuration_qwen2_vl import (
     Qwen2VLConfig, Qwen2VLVisionConfig)
 from transformers.models.qwen2_vl.image_processing_qwen2_vl import smart_resize
+from transformers.utils import is_flash_attn_2_available
 
 from vllm.attention import AttentionMetadata
+from vllm.attention.layer import MultiHeadAttention
 from vllm.config import VllmConfig
 from vllm.distributed import parallel_state, tensor_model_parallel_all_gather
 from vllm.distributed import utils as dist_utils
@@ -69,7 +71,6 @@ from .interfaces import SupportsLoRA, SupportsMultiModal, SupportsPP
 from .utils import (AutoWeightsLoader, WeightsMapper,
                     init_vllm_registered_model, maybe_prefix,
                     merge_multimodal_embeddings)
-from .vision import get_vit_attn_backend
 
 logger = init_logger(__name__)
 
@@ -232,92 +233,18 @@ def apply_rotary_pos_emb_vision(t: torch.Tensor,
     return output
 
 
-class Qwen2VisionAttention(nn.Module):
+class Qwen2MHA(MultiHeadAttention):
+    """Multi-head attention with attention mask."""
 
-    def __init__(
-        self,
-        embed_dim: int,
-        num_heads: int,
-        projection_size: int,
-        quant_config: Optional[QuantizationConfig] = None,
-        prefix: str = "",
-    ) -> None:
-        super().__init__()
-        # Per attention head and per partition values.
-        world_size = parallel_state.get_tensor_model_parallel_world_size()
-        self.tp_size = world_size
-        self.tp_rank = parallel_state.get_tensor_model_parallel_rank()
-        self.hidden_size_per_attention_head = dist_utils.divide(
-            projection_size, num_heads)
-        self.num_attention_heads_per_partition = dist_utils.divide(
-            num_heads, world_size)
-
-        self.qkv = ColumnParallelLinear(input_size=embed_dim,
-                                        output_size=3 * projection_size,
-                                        quant_config=quant_config,
-                                        prefix=f"{prefix}.qkv")
-        self.proj = RowParallelLinear(input_size=projection_size,
-                                      output_size=embed_dim,
-                                      quant_config=quant_config,
-                                      prefix=f"{prefix}.proj")
-
-        # Detect attention implementation.
-        self.attn_backend: _Backend = get_vit_attn_backend(support_fa=True)
-        if self.attn_backend not in {
-                _Backend.FLASH_ATTN, _Backend.TORCH_SDPA, _Backend.XFORMERS
-        }:
-            raise RuntimeError(
-                f"Qwen2-VL does not support {self.attn_backend} backend now.")
-
-    def split_qkv(self, qkv: torch.Tensor) -> tuple[torch.Tensor, ...]:
-        # [s, b, 3 * head * head_dim]
-        seq_len, bs, _ = qkv.shape
-        if self.tp_size > 1:
-            qkv = tensor_model_parallel_all_gather(qkv)
-
-        # [s, b, 3 * head * head_dim] -> 3 * [s, b, head * head_dim]
-        q, k, v = qkv.chunk(3, dim=2)
-
-        # 3 * [s, b, head * head_dim]
-        if self.tp_size > 1:
-            splitter = partial(dist_utils.split_tensor_along_last_dim,
-                               num_partitions=self.tp_size)
-            q = splitter(q)[self.tp_rank]
-            k = splitter(k)[self.tp_rank]
-            v = splitter(v)[self.tp_rank]
-
-        # 3 * [s, b, head * head_dim] -> 3 * [s, b, head, head_dim]
-        new_shape = (seq_len, bs, self.num_attention_heads_per_partition,
-                     self.hidden_size_per_attention_head)
-        q, k, v = (x.view(*new_shape) for x in (q, k, v))
-        return q, k, v
-
-    def forward(
-        self,
-        x: torch.Tensor,
-        cu_seqlens: torch.Tensor,
-        rotary_pos_emb: torch.Tensor,
-    ) -> torch.Tensor:
-
-        # [s, b, c] --> [s, b, 3 * head * head_dim]
-        x, _ = self.qkv(x)
-
-        # [s, b, 3 * head * head_dim] -> 3 * [s, b, head, head_dim]
-        q, k, v = self.split_qkv(x)
-        batch_size = q.shape[1]
-
-        q, k, v = (rearrange(x, "s b ... -> b s ...").contiguous()
-                   for x in (q, k, v))
-        if rotary_pos_emb is not None:
-            q = apply_rotary_pos_emb_vision(q, rotary_pos_emb)
-            k = apply_rotary_pos_emb_vision(k, rotary_pos_emb)
-
-        if self.attn_backend == _Backend.FLASH_ATTN:
+    def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
+                cu_seqlens: torch.Tensor):
+        if is_flash_attn_2_available():
             # from vllm_flash_attn.flash_attn_interface import (
             #   flash_attn_varlen_func)
             from flash_attn import flash_attn_varlen_func
 
-            q, k, v = (rearrange(x, "b s ... -> (b s) ...") for x in [q, k, v])
+            batch_size = q.size(0)
+            q, k, v = (rearrange(x, "b s ... -> (b s) ...") for x in (q, k, v))
 
             max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max().item()
             output = flash_attn_varlen_func(q,
@@ -355,9 +282,88 @@ class Qwen2VisionAttention(nn.Module):
             seqlens = (cu_seqlens[1:] - cu_seqlens[:-1]).tolist()
             attn_bias = BlockDiagonalMask.from_seqlens(q_seqlen=seqlens,
                                                        kv_seqlen=None)
-
             context_layer = xops.memory_efficient_attention_forward(
                 q, k, v, attn_bias=attn_bias, p=0, scale=None)
+        return context_layer
+
+
+class Qwen2VisionAttention(nn.Module):
+
+    def __init__(
+        self,
+        embed_dim: int,
+        num_heads: int,
+        projection_size: int,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+    ) -> None:
+        super().__init__()
+        # Per attention head and per partition values.
+        world_size = parallel_state.get_tensor_model_parallel_world_size()
+        self.tp_size = world_size
+        self.tp_rank = parallel_state.get_tensor_model_parallel_rank()
+        self.hidden_size_per_attention_head = dist_utils.divide(
+            projection_size, num_heads)
+        self.num_attention_heads_per_partition = dist_utils.divide(
+            num_heads, world_size)
+
+        self.qkv = ColumnParallelLinear(input_size=embed_dim,
+                                        output_size=3 * projection_size,
+                                        quant_config=quant_config,
+                                        prefix=f"{prefix}.qkv")
+        self.proj = RowParallelLinear(input_size=projection_size,
+                                      output_size=embed_dim,
+                                      quant_config=quant_config,
+                                      prefix=f"{prefix}.proj")
+
+        self.scale = self.hidden_size_per_attention_head**-0.5
+        self.attn = Qwen2MHA(num_heads=num_heads,
+                             head_size=self.hidden_size_per_attention_head,
+                             scale=self.scale)
+
+    def split_qkv(self, qkv: torch.Tensor) -> tuple[torch.Tensor, ...]:
+        # [s, b, 3 * head * head_dim]
+        seq_len, bs, _ = qkv.shape
+        if self.tp_size > 1:
+            qkv = tensor_model_parallel_all_gather(qkv)
+
+        # [s, b, 3 * head * head_dim] -> 3 * [s, b, head * head_dim]
+        q, k, v = qkv.chunk(3, dim=2)
+
+        # 3 * [s, b, head * head_dim]
+        if self.tp_size > 1:
+            splitter = partial(dist_utils.split_tensor_along_last_dim,
+                               num_partitions=self.tp_size)
+            q = splitter(q)[self.tp_rank]
+            k = splitter(k)[self.tp_rank]
+            v = splitter(v)[self.tp_rank]
+
+        # 3 * [s, b, head * head_dim] -> 3 * [s, b, head, head_dim]
+        new_shape = (seq_len, bs, self.num_attention_heads_per_partition,
+                     self.hidden_size_per_attention_head)
+        q, k, v = (x.view(*new_shape) for x in (q, k, v))
+        return q, k, v
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        rotary_pos_emb: torch.Tensor,
+    ) -> torch.Tensor:
+
+        # [s, b, c] --> [s, b, 3 * head * head_dim]
+        x, _ = self.qkv(x)
+
+        # [s, b, 3 * head * head_dim] -> 3 * [s, b, head, head_dim]
+        q, k, v = self.split_qkv(x)
+
+        q, k, v = (rearrange(x, "s b ... -> b s ...").contiguous()
+                   for x in (q, k, v))
+        if rotary_pos_emb is not None:
+            q = apply_rotary_pos_emb_vision(q, rotary_pos_emb)
+            k = apply_rotary_pos_emb_vision(k, rotary_pos_emb)
+
+        context_layer = self.attn(q, k, v, cu_seqlens)
         context_layer = rearrange(context_layer,
                                   "b s h d -> s b (h d)").contiguous()
 
