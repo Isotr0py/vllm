@@ -302,8 +302,8 @@ See [this page](#generative-models) for more information on how to use generativ
   - ✅︎
   - ✅︎
 * - `Phi3ForCausalLM`
-  - Phi-3
-  - `microsoft/Phi-3-mini-4k-instruct`, `microsoft/Phi-3-mini-128k-instruct`, `microsoft/Phi-3-medium-128k-instruct`, etc.
+  - Phi-4, Phi-3
+  - `microsoft/Phi-4`, `microsoft/Phi-3-mini-4k-instruct`, `microsoft/Phi-3-mini-128k-instruct`, `microsoft/Phi-3-medium-128k-instruct`, etc.
   - ✅︎
   - ✅︎
 * - `Phi3SmallForCausalLM`
@@ -468,6 +468,11 @@ of the whole prompt are extracted from the normalized hidden state corresponding
 * - `Qwen2ForRewardModel`
   - Qwen2-based
   - `Qwen/Qwen2.5-Math-RM-72B`, etc.
+  - ✅︎
+  - ✅︎
+* - `Qwen2ForProcessRewardModel`
+  - Qwen2-based
+  - `Qwen/Qwen2.5-Math-PRM-7B`, `Qwen/Qwen2.5-Math-PRM-72B`, etc.
   - ✅︎
   - ✅︎
 ```
@@ -754,7 +759,7 @@ See [this page](#generative-models) for more information on how to use generativ
   - `Qwen/QVQ-72B-Preview`, `Qwen/Qwen2-VL-7B-Instruct`, `Qwen/Qwen2-VL-72B-Instruct`, etc.
   - ✅︎
   - ✅︎
-  -
+  - ✅︎
 * - `UltravoxModel`
   - Ultravox
   - T + A<sup>E+</sup>
@@ -767,15 +772,9 @@ See [this page](#generative-models) for more information on how to use generativ
 <sup>E</sup> Pre-computed embeddings can be inputted for this modality.  
 <sup>+</sup> Multiple items can be inputted per text prompt for this modality.
 
-````{note}
-To use `DeepSeek-VL2` series models, you need to install a fork version `deepseek_vl2` package:
-
-```shell
-pip install git+https://github.com/Isotr0py/DeepSeek-VL2.git
+```{note}
+To use `DeepSeek-VL2` series models, you have to pass `--hf_overrides '{"architectures": ["DeepseekVLV2ForCausalLM"]}'` when running vLLM.
 ```
-
-Besides, to run `DeepSeek-VL2` series models, you have to pass `--hf_overrides '{"architectures": ["DeepseekVLV2ForCausalLM"]}'` when running vLLM.
-````
 
 ```{note}
 To use `TIGER-Lab/Mantis-8B-siglip-llama3`, you have to pass `--hf_overrides '{"architectures": ["MantisForConditionalGeneration"]}'` when running vLLM.
