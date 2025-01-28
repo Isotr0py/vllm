@@ -147,13 +147,12 @@ class XFormersImpl(AttentionImpl[XFormersMetadata]):
 
     def forward(
         self,
+        layer: torch.nn.Module,
         query: torch.Tensor,
         key: torch.Tensor,
         value: torch.Tensor,
         kv_cache: torch.Tensor,
         attn_metadata: XFormersMetadata,
-        k_scale: float = 1.0,
-        v_scale: float = 1.0,
     ) -> torch.Tensor:
         """Forward pass with Xformers.
 
@@ -166,12 +165,13 @@ class XFormersImpl(AttentionImpl[XFormersMetadata]):
         Returns:
             shape = [num_tokens, num_heads * head_size]
         """
-        assert k_scale == 1.0 and v_scale == 1.0, (
+        assert layer._k_scale == 1.0 and layer._v_scale == 1.0, (
             "key/v_scale is not supported in XformersAttention.")
-        
+
         if attn_metadata is None:
-            shape = (query.size(0), self.num_heads * self.head_size)
-            return torch.zeros(shape, device=query.device)
+            # shape = (query.size(0), self.num_heads * self.head_size)
+            # return torch.zeros(shape, device=query.device, dtype=query.dtype)
+            return torch.zeros_like(query)
 
         # IMPORTANT!
         # NOTE(woosuk): With piece-wise CUDA graphs, this method is executed in
@@ -185,7 +185,12 @@ class XFormersImpl(AttentionImpl[XFormersMetadata]):
         num_actual_tokens = attn_metadata.num_actual_tokens
 
         # Reshape the input keys and values and store them in the cache.
-        key_cache, value_cache = kv_cache.unbind(0)
+        # key_cache, value_cache = kv_cache.unbind(0)
+        query = query.view(-1, self.num_heads, self.head_size)
+        key = key.view(-1, self.num_kv_heads, self.head_size)
+        value = value.view(-1, self.num_kv_heads, self.head_size)
+        key_cache, value_cache = PagedAttention.split_kv_cache(
+            kv_cache, self.num_kv_heads, self.head_size)
         PagedAttention.write_to_paged_cache(
             key,
             value,
@@ -193,15 +198,15 @@ class XFormersImpl(AttentionImpl[XFormersMetadata]):
             value_cache,
             attn_metadata.slot_mapping,
             self.kv_cache_dtype,
-            k_scale,
-            v_scale,
+            layer._k_scale,
+            layer._v_scale,
         )
         attn_bias = BlockDiagonalMask.from_seqlens([num_actual_tokens])
         output = xops.memory_efficient_attention_forward(
             query[:num_actual_tokens].unsqueeze(0),
             key.unsqueeze(0),
             value.unsqueeze(0),
-            attn_bias=attn_bias[0],
+            attn_bias=attn_bias,
             p=0.0,
             scale=self.scale)
-        return output
+        return output.view(-1, self.num_heads * self.head_size)
