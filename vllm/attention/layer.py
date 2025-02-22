@@ -231,6 +231,7 @@ class MultiHeadAttention(nn.Module):
         head_size: int,
         scale: float,
         num_kv_heads: Optional[int] = None,
+        **extra_impl_args,
     ):
         super().__init__()
         self.num_heads = num_heads

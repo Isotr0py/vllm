@@ -7,9 +7,11 @@ from typing import (Iterable, List, Mapping, Optional, Set, Tuple, TypedDict,
 import numpy as np
 import torch
 from torch import nn
-from transformers.models.whisper.modeling_whisper import sinusoids
+from transformers.models.whisper.modeling_whisper import (WhisperConfig,
+                                                          sinusoids)
 
 from vllm.attention import Attention, AttentionMetadata, AttentionType
+from vllm.attention.layer import MultiHeadAttention
 from vllm.config import CacheConfig, VllmConfig
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.inputs import INPUT_REGISTRY, DummyData, InputContext
@@ -100,7 +102,10 @@ class WhisperAttention(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.out_proj",
         )
-        self.attn = Attention(
+
+        attn_impl = (MultiHeadAttention
+                     if attn_type == AttentionType.ENCODER_ONLY else Attention)
+        self.attn = attn_impl(
             self.num_heads,
             self.head_dim,
             self.scaling,
@@ -254,7 +259,11 @@ class WhisperMLP(nn.Module):
 
 class WhisperEncoderLayer(nn.Module):
 
-    def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+    def __init__(self,
+                 *,
+                 vllm_config: VllmConfig,
+                 attn_type: AttentionType = AttentionType.ENCODER,
+                 prefix: str = ""):
         super().__init__()
         config = vllm_config.model_config.hf_config
         cache_config = vllm_config.cache_config
@@ -264,7 +273,7 @@ class WhisperEncoderLayer(nn.Module):
         self.self_attn = WhisperAttention(
             embed_dim=self.embed_dim,
             num_heads=config.encoder_attention_heads,
-            attn_type=AttentionType.ENCODER,
+            attn_type=attn_type,
             cache_config=cache_config,
             quant_config=quant_config,
             prefix=f"{prefix}.self_attn",
@@ -375,9 +384,14 @@ class WhisperDecoderLayer(nn.Module):
 
 class WhisperEncoder(nn.Module):
 
-    def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+    def __init__(self,
+                 *,
+                 vllm_config: VllmConfig,
+                 hf_config_override: Optional[WhisperConfig] = None,
+                 attn_type: AttentionType = AttentionType.ENCODER,
+                 prefix: str = ""):
         super().__init__()
-        config = vllm_config.model_config.hf_config
+        config = hf_config_override or vllm_config.model_config.hf_config
         embed_dim = config.d_model
         self.num_mel_bins = config.num_mel_bins
         self.padding_idx = config.pad_token_id
@@ -399,6 +413,7 @@ class WhisperEncoder(nn.Module):
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.encoder_layers,
             lambda prefix: WhisperEncoderLayer(vllm_config=vllm_config,
+                                               attn_type=attn_type,
                                                prefix=f"{prefix}.layers"),
             prefix=f"{prefix}.layers",
         )
