@@ -6,6 +6,8 @@ from typing import List, Optional, Set, Tuple, TypedDict, Union
 
 import torch
 from torch import nn
+from transformers import (BatchFeature, WhisperFeatureExtractor,
+                          WhisperProcessor)
 from transformers.models.whisper.modeling_whisper import (WhisperConfig,
                                                           sinusoids)
 

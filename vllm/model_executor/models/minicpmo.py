@@ -31,6 +31,7 @@ import torch
 from torch import nn
 from transformers import BatchFeature
 
+from vllm.attention import AttentionType
 from vllm.config import VllmConfig
 from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalKwargs
 from vllm.multimodal.inputs import MultiModalFieldConfig
@@ -415,132 +416,6 @@ class MultiModalProjector(nn.Module):
         hidden_states = self.relu(self.linear1(audio_features))
         hidden_states = self.linear2(hidden_states)
         return hidden_states
-
-
-class MiniCPMWhisperEncoderLayer(nn.Module):
-
-    def __init__(self, config: WhisperConfig, layer_idx: int):
-        super().__init__()
-        self.embed_dim = config.d_model
-        self.self_attn = WHISPER_ATTENTION_CLASSES[
-            config._attn_implementation](
-                embed_dim=self.embed_dim,
-                num_heads=config.encoder_attention_heads,
-                dropout=config.attention_dropout,
-                config=config,
-                layer_idx=layer_idx,
-            )
-        self.self_attn_layer_norm = nn.LayerNorm(self.embed_dim)
-        self.dropout = config.dropout
-        self.activation_fn = ACT2FN[config.activation_function]
-        self.activation_dropout = config.activation_dropout
-        self.fc1 = nn.Linear(self.embed_dim, config.encoder_ffn_dim)
-        self.fc2 = nn.Linear(config.encoder_ffn_dim, self.embed_dim)
-        self.final_layer_norm = nn.LayerNorm(self.embed_dim)
-
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        attention_mask: torch.Tensor,
-    ) -> torch.Tensor:
-        residual = hidden_states
-        past_key_values = None
-        hidden_states = self.self_attn_layer_norm(hidden_states)
-        hidden_states, attn_weights, past_key_values = self.self_attn(
-            hidden_states=hidden_states,
-            attention_mask=attention_mask,
-            past_key_value=past_key_values,
-        )
-        hidden_states = nn.functional.dropout(hidden_states,
-                                              p=self.dropout,
-                                              training=self.training)
-        hidden_states = residual + hidden_states
-
-        residual = hidden_states
-        hidden_states = self.final_layer_norm(hidden_states)
-        hidden_states = self.activation_fn(self.fc1(hidden_states))
-        hidden_states = nn.functional.dropout(hidden_states,
-                                              p=self.activation_dropout,
-                                              training=self.training)
-        hidden_states = self.fc2(hidden_states)
-        hidden_states = nn.functional.dropout(hidden_states,
-                                              p=self.dropout,
-                                              training=self.training)
-        hidden_states = residual + hidden_states
-
-        if hidden_states.dtype == torch.float16 and (
-                torch.isinf(hidden_states).any()
-                or torch.isnan(hidden_states).any()):
-            clamp_value = torch.finfo(hidden_states.dtype).max - 1000
-            hidden_states = torch.clamp(hidden_states,
-                                        min=-clamp_value,
-                                        max=clamp_value)
-
-        outputs = (hidden_states, )
-
-        return outputs
-
-
-class MiniCPMWhisperEncoder(WhisperEncoder):
-
-    def __init__(self, config: WhisperConfig):
-        super().__init__(config)
-        self.layers = nn.ModuleList([
-            MiniCPMWhisperEncoderLayer(config, layer_idx=i)
-            for i in range(config.encoder_layers)
-        ])
-
-    def forward(
-        self,
-        input_features: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-    ) -> BaseModelOutputWithPast:
-        # Ignore copy
-        input_features = input_features.to(dtype=self.conv1.weight.dtype,
-                                           device=self.conv1.weight.device)
-
-        inputs_embeds = nn.functional.gelu(self.conv1(input_features))
-        inputs_embeds = nn.functional.gelu(self.conv2(inputs_embeds))
-
-        inputs_embeds = inputs_embeds.permute(0, 2, 1)
-
-        embed_pos = self.embed_positions.weight
-
-        embed_pos = embed_pos[:inputs_embeds.shape[1], :]
-
-        hidden_states = inputs_embeds + embed_pos
-        hidden_states = nn.functional.dropout(hidden_states,
-                                              p=self.dropout,
-                                              training=self.training)
-
-        encoder_states = ()
-
-        for idx, encoder_layer in enumerate(self.layers):
-            encoder_states = encoder_states + (hidden_states, )
-            to_drop = False
-            if self.training:
-                dropout_probability = torch.rand([])
-                if dropout_probability < self.layerdrop:  # skip the layer
-                    to_drop = True
-
-            # Ignore copy
-            if to_drop:
-                layer_outputs = (None, None)
-            else:
-                layer_outputs = encoder_layer(
-                    hidden_states,
-                    attention_mask,
-                )
-
-                hidden_states = layer_outputs[0]
-
-        hidden_states = self.layer_norm(hidden_states)
-        encoder_states = encoder_states + (hidden_states, )
-
-        return BaseModelOutputWithPast(
-            last_hidden_state=hidden_states,
-            hidden_states=encoder_states,
-        )
 
 
 @MULTIMODAL_REGISTRY.register_processor(
