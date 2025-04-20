@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 import math
 from collections.abc import Iterable, Mapping, Sequence
+from functools import cached_property
 from typing import Any, Dict, List, Literal, Optional, Tuple, TypedDict, Union
 
 import numpy as np
@@ -11,12 +12,8 @@ from transformers import (BatchFeature, PretrainedConfig, ProcessorMixin,
 
 from vllm.config import VllmConfig
 from vllm.distributed import get_pp_group
-from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.sampler import SamplerOutput, get_sampler
-from vllm.model_executor.layers.vocab_parallel_embedding import (
-    DEFAULT_VOCAB_PADDING_SIZE, ParallelLMHead)
-from vllm.model_executor.models.llama import LlamaModel
 from vllm.model_executor.models.module_mapping import MultiModelKeys
 from vllm.model_executor.sampling_metadata import SamplingMetadata
 from vllm.multimodal import MULTIMODAL_REGISTRY
@@ -35,8 +32,8 @@ from vllm.utils import is_list_of
 from .idefics2_vision_model import Idefics2VisionTransformer
 from .interfaces import MultiModalEmbeddings, SupportsLoRA, SupportsMultiModal
 from .phi4mm_audio import AudioEmbedding
-from .utils import (AutoWeightsLoader, WeightsMapper, flatten_bn, maybe_prefix,
-                    merge_multimodal_embeddings)
+from .utils import (AutoWeightsLoader, WeightsMapper, flatten_bn,
+                    init_vllm_registered_model, merge_multimodal_embeddings)
 
 # <|endoftext10|> (see vocab.json in hf model)
 _IMAGE_PLACEHOLDER_TOKEN_ID = 200010
@@ -908,6 +905,7 @@ class Phi4MMForCausalLM(nn.Module, SupportsLoRA, SupportsMultiModal):
             "embed_tokens_extend.audio_projection.",
             "model.embed_tokens_extend.audio_embed.": "embed_tokens_extend.",
             "model.embed_tokens_extend.image_embed.": "vision_encoder.",
+            "model.": "language_model.model.",
         },
     )
 
@@ -946,29 +944,23 @@ class Phi4MMForCausalLM(nn.Module, SupportsLoRA, SupportsMultiModal):
             }
 
         self.embed_tokens_extend = AudioEmbedding(config, **embedding_config)
-        self.model = LlamaModel(vllm_config=vllm_config,
-                                prefix=maybe_prefix(prefix, "model"))
-
-        self.unpadded_vocab_size = config.vocab_size
-        if lora_config:
-            self.unpadded_vocab_size += lora_config.lora_extra_vocab_size
-        self.lm_head = ParallelLMHead(
-            self.unpadded_vocab_size,
-            config.hidden_size,
-            org_num_embeddings=config.vocab_size,
-            padding_size=(
-                DEFAULT_VOCAB_PADDING_SIZE
-                # We need bigger padding if using lora for kernel
-                # compatibility
-                if not lora_config else lora_config.lora_vocab_padding_size),
-            quant_config=quant_config,
+        self.language_model = init_vllm_registered_model(
+            vllm_config=vllm_config,
+            # The prefix is empty intentionally because default prefix of
+            # LlamaForCausalLM is "model"
+            prefix="",
+            # We don't directly initialize vLLM's LlamaForCausalLM so we
+            # can automatically apply embedding wrapper if this model is
+            # initialized as an embedding model
+            architectures=["LlamaForCausalLM"],
         )
-        if config.tie_word_embeddings:
-            self.lm_head = self.lm_head.tie_weights(self.model.embed_tokens)
-        logit_scale = getattr(config, "logit_scale", 1.0)
-        self.logits_processor = LogitsProcessor(self.unpadded_vocab_size,
-                                                config.vocab_size, logit_scale)
-        self.sampler = get_sampler()
+
+    @cached_property
+    def sampler(self):
+        if hasattr(self.language_model, "sampler"):
+            return self.language_model.sampler
+
+        return get_sampler()
 
     def _parse_and_validate_audio_input(
             self, **kwargs: object) -> Optional[Phi4MMAudioInputs]:
@@ -1163,7 +1155,7 @@ class Phi4MMForCausalLM(nn.Module, SupportsLoRA, SupportsMultiModal):
         input_ids: torch.Tensor,
         multimodal_embeddings: Optional[MultiModalEmbeddings] = None,
     ) -> torch.Tensor:
-        inputs_embeds = self.model.embed_tokens(input_ids)
+        inputs_embeds = self.language_model.get_input_embeddings(input_ids)
         if multimodal_embeddings is not None:
             inputs_embeds = merge_multimodal_embeddings(
                 input_ids, inputs_embeds, multimodal_embeddings,
@@ -1226,7 +1218,7 @@ class Phi4MMForCausalLM(nn.Module, SupportsLoRA, SupportsMultiModal):
                     audio_input=audio_input)
                 input_ids = None
 
-        hidden_states = self.model(
+        hidden_states = self.language_model(
             input_ids,
             positions,
             intermediate_tensors,
@@ -1240,17 +1232,15 @@ class Phi4MMForCausalLM(nn.Module, SupportsLoRA, SupportsMultiModal):
         hidden_states: torch.Tensor,
         sampling_metadata: SamplingMetadata,
     ) -> Optional[torch.Tensor]:
-        logits = self.logits_processor(self.lm_head, hidden_states,
-                                       sampling_metadata)
-        return logits
+        return self.language_model.compute_logits(hidden_states,
+                                                  sampling_metadata)
 
     def sample(
         self,
         logits: torch.Tensor,
         sampling_metadata: SamplingMetadata,
     ) -> Optional[SamplerOutput]:
-        next_tokens = self.sampler(logits, sampling_metadata)
-        return next_tokens
+        return self.language_model.sample(logits, sampling_metadata)
 
     def load_weights(self, weights: Iterable[Tuple[str,
                                                    torch.Tensor]]) -> None:
@@ -1264,10 +1254,10 @@ class Phi4MMForCausalLM(nn.Module, SupportsLoRA, SupportsMultiModal):
         Get the module prefix in multimodal models
         """
         return MultiModelKeys.from_string_field(
-            language_model="model.",
+            language_model="language_model",
             connector=["audio_projection_for_vision", "audio_projection"],
             tower_model=["vision_encoder", "embed_tokens_extend"],
         )
 
     def get_language_model(self) -> torch.nn.Module:
-        return self.model
+        return self.language_model
