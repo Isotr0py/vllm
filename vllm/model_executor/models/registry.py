@@ -173,6 +173,7 @@ _CROSS_ENCODER_MODELS = {
 
 _MULTIMODAL_MODELS = {
     # [Decoder-only]
+    "AeroForConditionalGeneration": ("aero", "AeroForConditionalGeneration"),
     "AriaForConditionalGeneration": ("aria", "AriaForConditionalGeneration"),
     "AyaVisionForConditionalGeneration": ("aya_vision", "AyaVisionForConditionalGeneration"),  # noqa: E501
     "Blip2ForConditionalGeneration": ("blip2", "Blip2ForConditionalGeneration"),

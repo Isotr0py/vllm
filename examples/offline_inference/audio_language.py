@@ -69,6 +69,31 @@ def run_granite_speech(question: str, audio_count: int) -> ModelRequestData:
     )
 
 
+# Aero-1-Audio
+def run_aero(question: str, audio_count: int) -> ModelRequestData:
+    model_name = "lmms-lab/Aero-1-Audio"
+
+    engine_args = EngineArgs(
+        model=model_name,
+        max_model_len=4096,
+        max_num_seqs=5,
+        limit_mm_per_prompt={"audio": audio_count},
+        trust_remote_code=True,
+    )
+
+    audio_placeholder = "<|AUDIO|>" * audio_count
+
+    prompt = ("<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n"
+              "<|im_start|>user\n"
+              f"{audio_placeholder}{question}<|im_end|>\n"
+              "<|im_start|>assistant\n")
+
+    return ModelRequestData(
+        engine_args=engine_args,
+        prompt=prompt,
+    )
+
+
 # MiniCPM-O
 def run_minicpmo(question: str, audio_count: int) -> ModelRequestData:
     model_name = "openbmb/MiniCPM-o-2_6"
@@ -240,6 +265,7 @@ def run_whisper(question: str, audio_count: int) -> ModelRequestData:
 
 
 model_example_map = {
+    "aero": run_aero,
     "granite_speech": run_granite_speech,
     "minicpmo": run_minicpmo,
     "phi4_mm": run_phi4mm,
