@@ -9,8 +9,8 @@ from pathlib import PosixPath
 
 import pytest
 from transformers import (AutoModel, AutoModelForImageTextToText,
-                          AutoModelForSpeechSeq2Seq,
-                          AutoModelForTextToWaveform, AutoModelForVision2Seq)
+                          AutoModelForSeq2SeqLM, AutoModelForTextToWaveform,
+                          AutoModelForVision2Seq)
 
 from vllm.platforms import current_platform
 from vllm.utils import identity
@@ -593,7 +593,10 @@ VLM_TEST_SETTINGS = {
         audio_idx_to_prompt=lambda idx: f"Audio {idx + 1}: <|audio_bos|><|AUDIO|><|audio_eos|>\n",  # noqa: E501
         max_model_len=4096,
         max_num_seqs=2,
-        auto_cls=AutoModelForSpeechSeq2Seq,
+        auto_cls=AutoModelForSeq2SeqLM,
+        tensor_parallel_size=2,
+        hf_model_kwargs={"device_map": "auto"},
+        marks=multi_gpu_marks(num_gpus=2),
     ),
     "skywork_r1v": VLMTestInfo(
         models=["Skywork/Skywork-R1V-38B"],
