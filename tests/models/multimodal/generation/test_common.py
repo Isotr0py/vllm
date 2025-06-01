@@ -9,6 +9,7 @@ from pathlib import PosixPath
 
 import pytest
 from transformers import (AutoModel, AutoModelForImageTextToText,
+                          AutoModelForSpeechSeq2Seq,
                           AutoModelForTextToWaveform, AutoModelForVision2Seq)
 
 from vllm.platforms import current_platform
@@ -584,6 +585,15 @@ VLM_TEST_SETTINGS = {
         vllm_output_post_proc=model_utils.qwen2_vllm_to_hf_output,
         image_size_factors=[(), (0.25,), (0.25, 0.25, 0.25), (0.25, 0.2, 0.15)],
         marks=[pytest.mark.cpu_model],
+    ),
+    "qwen2_audio": VLMTestInfo(
+        models = ["Qwen/Qwen2-Audio-7B-Instruct"],
+        test_type=VLMTestType.AUDIO,
+        prompt_formatter=lambda audio_prompt: f"<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\n{audio_prompt}<|im_end|>\n<|im_start|>assistant\n", # noqa: E501
+        audio_idx_to_prompt=lambda idx: f"Audio {idx + 1}: <|audio_bos|><|AUDIO|><|audio_eos|>\n",  # noqa: E501
+        max_model_len=4096,
+        max_num_seqs=2,
+        auto_cls=AutoModelForSpeechSeq2Seq,
     ),
     "skywork_r1v": VLMTestInfo(
         models=["Skywork/Skywork-R1V-38B"],
