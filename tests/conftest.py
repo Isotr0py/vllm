@@ -422,9 +422,13 @@ class HfRunner:
                 # HACK - not all processors take sampling_rate; we should
                 # clean this up in the future.
                 if len(audio_inputs) == 2:
-                    audio, sr = audio_inputs
+                    audio = list(map(lambda x: x[0], audio_inputs))
+                    sr = list(set(map(lambda x: x[1], audio_inputs)))
+                    assert len(sr) == 1, (
+                        "Expect all audios have same sampling rate, "
+                        f"but get {sr}.")
                     processor_kwargs["audio"] = audio
-                    processor_kwargs["sampling_rate"] = sr
+                    processor_kwargs["sampling_rate"] = sr[0]
                 else:
                     processor_kwargs["audio"] = audio_inputs
 
