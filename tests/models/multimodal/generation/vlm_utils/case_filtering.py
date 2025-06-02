@@ -83,7 +83,8 @@ def get_parametrized_options(test_settings: dict[str, VLMTestInfo],
                 test_info.num_video_frames)
 
         # No sizes passed for custom inputs, since inputs are directly provided
-        if test_type not in (VLMTestType.CUSTOM_INPUTS, VLMTestType.AUDIO):
+        if test_type not in (VLMTestType.CUSTOM_INPUTS, VLMTestType.AUDIO,
+                             VLMTestType.MULTI_AUDIO):
             wrapped_sizes = get_wrapped_test_sizes(test_info, test_type)
             if wrapped_sizes is None:
                 raise ValueError(
@@ -137,7 +138,8 @@ def get_wrapped_test_sizes(
             for factor in EMBEDDING_SIZE_FACTORS
         ])
     # Audio and Custom inputs have preprocessed inputs
-    elif test_type in (VLMTestType.AUDIO, VLMTestType.CUSTOM_INPUTS):
+    elif test_type in (VLMTestType.AUDIO, VLMTestType.MULTI_AUDIO,
+                       VLMTestType.CUSTOM_INPUTS):
         return tuple()
 
     size_factors = test_info.image_size_factors \

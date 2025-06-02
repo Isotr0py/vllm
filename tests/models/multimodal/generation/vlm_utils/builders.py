@@ -304,7 +304,7 @@ def build_multi_audio_inputs_from_test_info(
     if test_info.prompt_formatter is None:
         raise ValueError("Prompt formatter must be set to build audio inputs")
     model_prompts = get_model_prompts(
-        MULTI_AUDIO_BASE_PROMPT,
+        [MULTI_AUDIO_BASE_PROMPT],
         test_info.img_idx_to_prompt,
         test_info.video_idx_to_prompt,
         test_info.audio_idx_to_prompt,

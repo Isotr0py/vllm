@@ -588,7 +588,10 @@ VLM_TEST_SETTINGS = {
     ),
     "qwen2_audio": VLMTestInfo(
         models = ["Qwen/Qwen2-Audio-7B-Instruct"],
-        test_type=VLMTestType.AUDIO,
+        test_type=(
+            VLMTestType.AUDIO,
+            VLMTestType.MULTI_AUDIO,
+        ),
         prompt_formatter=lambda audio_prompt: f"<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\n{audio_prompt}<|im_end|>\n<|im_start|>assistant\n", # noqa: E501
         audio_idx_to_prompt=lambda idx: f"Audio {idx + 1}: <|audio_bos|><|AUDIO|><|audio_eos|>\n",  # noqa: E501
         max_model_len=4096,

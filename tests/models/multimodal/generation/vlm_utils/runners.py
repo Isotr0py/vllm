@@ -148,7 +148,7 @@ def run_multi_audio_test(
         dtype=test_case.dtype,
         max_tokens=test_case.max_tokens,
         num_logprobs=test_case.num_logprobs,
-        limit_mm_per_prompt=len(audio_assets),
+        limit_mm_per_prompt={"audio": len(audio_assets)},
         distributed_executor_backend=test_case.distributed_executor_backend,
         **model_test_info.get_non_parametrized_runner_kwargs())
 
