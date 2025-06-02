@@ -421,7 +421,7 @@ class HfRunner:
             if audios is not None and (audio_inputs := audios[i]) is not None:
                 # HACK - not all processors take sampling_rate; we should
                 # clean this up in the future.
-                if len(audio_inputs) == 2:
+                if isinstance(audio_inputs, list):
                     audio = list(map(lambda x: x[0], audio_inputs))
                     sr = list(set(map(lambda x: x[1], audio_inputs)))
                     assert len(sr) == 1, (
@@ -429,6 +429,10 @@ class HfRunner:
                         f"but get {sr}.")
                     processor_kwargs["audio"] = audio
                     processor_kwargs["sampling_rate"] = sr[0]
+                elif len(audio_inputs) == 2:
+                    audio, sr = audio_inputs
+                    processor_kwargs["audio"] = audio
+                    processor_kwargs["sampling_rate"] = sr
                 else:
                     processor_kwargs["audio"] = audio_inputs
 
