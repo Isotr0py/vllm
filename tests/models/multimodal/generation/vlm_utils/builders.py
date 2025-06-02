@@ -13,11 +13,11 @@ from vllm.multimodal.video import (rescale_video_size, resize_video,
                                    sample_frames_from_video)
 
 from .....conftest import AudioTestAssets, ImageTestAssets, VideoTestAssets
-from .types import (SINGLE_AUDIO_BASE_PROMPT, SINGLE_IMAGE_BASE_PROMPTS,
-                    TEST_AUDIO_PLACEHOLDER, TEST_IMG_PLACEHOLDER,
-                    TEST_VIDEO_PLACEHOLDER, VIDEO_BASE_PROMPT,
-                    ImageSizeWrapper, PromptWithMultiModalInput, SizeType,
-                    VLMTestInfo)
+from .types import (MULTI_AUDIO_BASE_PROMPT, SINGLE_AUDIO_BASE_PROMPT,
+                    SINGLE_IMAGE_BASE_PROMPTS, TEST_AUDIO_PLACEHOLDER,
+                    TEST_IMG_PLACEHOLDER, TEST_VIDEO_PLACEHOLDER,
+                    VIDEO_BASE_PROMPT, ImageSizeWrapper,
+                    PromptWithMultiModalInput, SizeType, VLMTestInfo)
 
 
 def replace_test_placeholder(prompt: str, mm_idx_to_prompt: Callable[[int],
@@ -293,5 +293,39 @@ def build_audio_inputs_from_test_info(
         PromptWithMultiModalInput(
             prompts=model_prompts,
             audio_data=resampled_audios,
+        )
+    ]
+
+
+def build_multi_audio_inputs_from_test_info(
+    test_info: VLMTestInfo,
+    audio_assets: AudioTestAssets,
+) -> list[PromptWithMultiModalInput]:
+    if test_info.prompt_formatter is None:
+        raise ValueError("Prompt formatter must be set to build audio inputs")
+    model_prompts = get_model_prompts(
+        MULTI_AUDIO_BASE_PROMPT,
+        test_info.img_idx_to_prompt,
+        test_info.video_idx_to_prompt,
+        test_info.audio_idx_to_prompt,
+        test_info.prompt_formatter,
+    )
+    resampler = AudioResampler(
+        target_sr=16000,
+        method="librosa",
+    )
+    audios = [asset.audio_and_sample_rate for asset in audio_assets]
+    resampled_audios = [(
+        resampler.resample(
+            audio,
+            orig_sr=sr,
+        ),
+        int(resampler.target_sr),
+    ) for audio, sr in audios]
+
+    return [
+        PromptWithMultiModalInput(
+            prompts=model_prompts,
+            audio_data=[resampled_audios],
         )
     ]

@@ -35,6 +35,7 @@ SINGLE_AUDIO_BASE_PROMPT = AUDIO_ASSETS.prompts({
 })
 
 MULTI_IMAGE_BASE_PROMPT = f"Image-1: {TEST_IMG_PLACEHOLDER}Image-2: {TEST_IMG_PLACEHOLDER}Describe the two images in detail.\n"  # noqa: E501
+MULTI_AUDIO_BASE_PROMPT = f"Audio-1: {TEST_AUDIO_PLACEHOLDER}Audio-2: {TEST_AUDIO_PLACEHOLDER}What sport and what nursery rhyme are referenced?\n"  # noqa: E501
 VIDEO_BASE_PROMPT = f"{TEST_VIDEO_PLACEHOLDER}Why is this video funny?"
 
 
@@ -58,7 +59,8 @@ class VLMTestType(Enum):
     EMBEDDING = 3
     VIDEO = 4
     AUDIO = 5
-    CUSTOM_INPUTS = 6
+    MULTI_AUDIO = 6
+    CUSTOM_INPUTS = 7
 
 
 class SizeType(Enum):

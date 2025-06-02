@@ -864,6 +864,29 @@ def test_audio_models(model_type: str, test_case: ExpandableVLMTestArgs,
     "model_type,test_case",
     get_parametrized_options(
         VLM_TEST_SETTINGS,
+        test_type=VLMTestType.MULTI_AUDIO,
+        create_new_process_for_each_test=False,
+    ))
+def test_multi_audio_models(model_type: str, test_case: ExpandableVLMTestArgs,
+                            hf_runner: type[HfRunner],
+                            vllm_runner: type[VllmRunner],
+                            audio_assets: AudioTestAssets, monkeypatch):
+    if model_type in REQUIRES_V0_MODELS:
+        monkeypatch.setenv("VLLM_USE_V1", "0")
+    model_test_info = VLM_TEST_SETTINGS[model_type]
+    runners.run_multi_audio_test(
+        model_test_info=model_test_info,
+        test_case=test_case,
+        hf_runner=hf_runner,
+        vllm_runner=vllm_runner,
+        audio_assets=audio_assets,
+    )
+
+
+@pytest.mark.parametrize(
+    "model_type,test_case",
+    get_parametrized_options(
+        VLM_TEST_SETTINGS,
         test_type=VLMTestType.CUSTOM_INPUTS,
         create_new_process_for_each_test=False,
     ))
@@ -1002,6 +1025,30 @@ def test_audio_models_heavy(model_type: str, test_case: ExpandableVLMTestArgs,
         monkeypatch.setenv("VLLM_USE_V1", "0")
     model_test_info = VLM_TEST_SETTINGS[model_type]
     runners.run_audio_test(
+        model_test_info=model_test_info,
+        test_case=test_case,
+        hf_runner=hf_runner,
+        vllm_runner=vllm_runner,
+        audio_assets=audio_assets,
+    )
+
+
+@pytest.mark.parametrize(
+    "model_type,test_case",
+    get_parametrized_options(
+        VLM_TEST_SETTINGS,
+        test_type=VLMTestType.MULTI_AUDIO,
+        create_new_process_for_each_test=True,
+    ))
+def test_multi_audio_models_heavy(model_type: str,
+                                  test_case: ExpandableVLMTestArgs,
+                                  hf_runner: type[HfRunner],
+                                  vllm_runner: type[VllmRunner],
+                                  audio_assets: AudioTestAssets, monkeypatch):
+    if model_type in REQUIRES_V0_MODELS:
+        monkeypatch.setenv("VLLM_USE_V1", "0")
+    model_test_info = VLM_TEST_SETTINGS[model_type]
+    runners.run_multi_audio_test(
         model_test_info=model_test_info,
         test_case=test_case,
         hf_runner=hf_runner,
