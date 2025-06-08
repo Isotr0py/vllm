@@ -237,11 +237,21 @@ class CudaPlatformBase(Platform):
                 # Prefer FlashInfer for V1 on Blackwell GPUs if installed
                 try:
                     import flashinfer  # noqa: F401
-                    logger.info_once(
-                        "Using FlashInfer backend on V1 engine by default for "
-                        "Blackwell (SM 10.0) GPUs.")
-                    return ("vllm.v1.attention.backends."
-                            "flashinfer.FlashInferBackend")
+
+                    from vllm.v1.attention.backends.flashinfer import (
+                        FlashInferBackend)
+                    supported_sizes = \
+                        FlashInferBackend.get_supported_head_sizes()
+                    if head_size in supported_sizes:
+                        logger.info_once(
+                            "Using FlashInfer backend on V1 engine by default "
+                            "for Blackwell (SM 10.0) GPUs.")
+                        return ("vllm.v1.attention.backends."
+                                "flashinfer.FlashInferBackend")
+                    else:
+                        logger.info_once(
+                            "Can't use FlashInfer backend on V1 engine for "
+                            "head size %d.", head_size)
                 except ImportError:
                     logger.info_once(
                         "FlashInfer failed to import for V1 engine on "
@@ -249,9 +259,21 @@ class CudaPlatformBase(Platform):
                         "install FlashInfer for better performance.")
                     pass
             if cls.has_device_capability(80):
-                logger.info_once("Using Flash Attention backend on V1 engine.")
-                return ("vllm.v1.attention.backends."
-                        "flash_attn.FlashAttentionBackend")
+                from vllm.v1.attention.backends.flash_attn import (
+                    FlashAttentionBackend)
+                supported_sizes = \
+                    FlashAttentionBackend.get_supported_head_sizes()
+                if head_size in supported_sizes:
+                    logger.info_once(
+                        "Using Flash Attention backend on V1 engine.")
+                    return ("vllm.v1.attention.backends."
+                            "flash_attn.FlashAttentionBackend")
+                else:
+                    logger.info_once(
+                        "Can't use Flash Attention backend on V1 engine for "
+                        "head size %d. Fall back to FlexAttention.", head_size)
+                    return ("vllm.v1.attention.backends."
+                            "flex_attention.FlexAttentionBackend")
         if selected_backend == _Backend.FLASHINFER:
             logger.info("Using FlashInfer backend.")
             return "vllm.attention.backends.flashinfer.FlashInferBackend"
@@ -292,7 +314,7 @@ class CudaPlatformBase(Platform):
         if target_backend == _Backend.FLASH_ATTN:
             try:
                 import vllm.vllm_flash_attn  # noqa: F401
-                from vllm.attention.backends.flash_attn import (  # noqa: F401
+                from vllm.attention.backends.flash_attn import (  # type: ignore[assignment]
                     FlashAttentionBackend, flash_attn_supports_fp8)
 
                 supported_sizes = \

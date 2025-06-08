@@ -47,7 +47,8 @@ class FlexAttentionBackend(AttentionBackend):
 
     @staticmethod
     def get_supported_head_sizes() -> list[int]:
-        return [16, 32, 64, 96, 128, 160, 192, 224, 256]
+        # Flex Attention support support all head_size in the range 16-256
+        return list(range(16, 257))
 
     @staticmethod
     def get_name() -> str:
@@ -358,7 +359,7 @@ class FlexAttentionImpl(AttentionImpl):
         if blocksparse_params is not None:
             # TODO we should support this :think
             raise ValueError(
-                "FlashAttention does not support block-sparse attention.")
+                "FlexAttention does not support block-sparse attention.")
         self.num_heads = num_heads
         self.head_size = head_size
         self.scale = float(scale)
