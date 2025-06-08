@@ -391,7 +391,7 @@ class FlexAttentionImpl(AttentionImpl):
         support_head_sizes = FlexAttentionBackend.get_supported_head_sizes()
         if head_size not in support_head_sizes:
             raise ValueError(
-                f"Head size {head_size} is not supported by FlashAttention. "
+                f"Head size {head_size} is not supported by FlexAttention. "
                 f"Supported head sizes are: {support_head_sizes}. "
                 "Set VLLM_USE_V1=0 to use another attention backend.")
         if is_quantized_kv_cache(self.kv_cache_dtype):
