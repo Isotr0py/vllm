@@ -33,7 +33,7 @@ from transformers.models.qwen2_audio import (Qwen2AudioConfig,
                                              Qwen2AudioProcessor)
 from transformers.models.whisper import WhisperFeatureExtractor
 
-from vllm.config import VllmConfig
+from vllm.config import VllmConfig, QuantizationConfig
 from vllm.model_executor.sampling_metadata import SamplingMetadata
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.inputs import (MultiModalDataDict, MultiModalFieldConfig,
@@ -267,8 +267,11 @@ class Qwen2AudioForConditionalGeneration(nn.Module, SupportsMultiModal,
         self.multimodal_config = multimodal_config
 
         self.audio_tower = Qwen2AudioEncoder(config.audio_config)
-        self.multi_modal_projector = Qwen2AudioMultiModalProjector(
-            config.audio_config.d_model, config.text_config.hidden_size)
+        self.multi_modal_projector = self._init_multi_modal_projector(
+            config=config,
+            quant_config=quant_config,
+            prefix=maybe_prefix(prefix, "multi_modal_projector")
+        )
 
         self.quant_config = quant_config
 
@@ -281,6 +284,15 @@ class Qwen2AudioForConditionalGeneration(nn.Module, SupportsMultiModal,
 
         self.make_empty_intermediate_tensors = (
             self.language_model.make_empty_intermediate_tensors)
+    
+    def _init_multi_modal_projector(self,
+        config: Qwen2AudioConfig,
+        quant_config: Optional[QuantizationConfig],
+        *,
+        prefix: str,
+    ):
+        return Qwen2AudioMultiModalProjector(
+            config.audio_config.d_model, config.text_config.hidden_size)
 
     def _validate_and_reshape_mm_tensor(self, mm_input: object,
                                         name: str) -> torch.Tensor:
