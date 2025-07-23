@@ -276,7 +276,7 @@ class Qwen2AudioForConditionalGeneration(nn.Module, SupportsMultiModal,
             vllm_config=vllm_config,
             hf_config=config.text_config,
             prefix=maybe_prefix(prefix, "language_model"),
-            architectures=["Qwen2ForCausalLM"],
+            architectures=config.text_config.architectures,
         )
 
         self.make_empty_intermediate_tensors = (
