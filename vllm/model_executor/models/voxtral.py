@@ -299,7 +299,7 @@ class VoxtralMultiModalProcessor(BaseMultiModalProcessor[VoxtralProcessingInfo]
 @MULTIMODAL_REGISTRY.register_processor(VoxtralMultiModalProcessor,
                                         info=VoxtralProcessingInfo,
                                         dummy_inputs=VoxtralDummyInputsBuilder)
-class VoxtralForConditionalGeneration(nn.Module, SupportsMultiModal,
+class WhixtralForConditionalGeneration(nn.Module, SupportsMultiModal,
                                       SupportsPP, SupportsTranscription):
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):

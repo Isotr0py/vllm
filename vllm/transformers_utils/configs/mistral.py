@@ -141,7 +141,7 @@ def _remap_mistral_audio_args(config: dict) -> dict:
     config = {
         "model_type":
         "whixtral",
-        "architectures": ["VoxtralForConditionalGeneration"],
+        "architectures": ["WhixtralForConditionalGeneration"],
         "text_config":
         PretrainedConfig.from_dict(config),
         "audio_config":
