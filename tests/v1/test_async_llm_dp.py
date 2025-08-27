@@ -23,7 +23,7 @@ from vllm.v1.metrics.stats import IterationStats, SchedulerStats
 DP_SIZE = int(os.getenv("DP_SIZE", 2))
 
 engine_args = AsyncEngineArgs(
-    model="ibm-research/PowerMoE-3b",
+    model="ibm-granite/granite-3.1-1b-a400m-instruct",
     enforce_eager=True,
     tensor_parallel_size=int(os.getenv("TP_SIZE", 1)),
     data_parallel_size=DP_SIZE,
