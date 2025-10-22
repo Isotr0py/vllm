@@ -524,8 +524,12 @@ class FlexAttentionMetadata:
         ).to(torch.int32)
 
         kv_num_blocks = (kv_indices >= 0).sum(dim=-1).to(torch.int32)
+
+        q_len = self.num_actual_tokens
+        kv_len = self.total_cache_tokens if self.causal else self.num_actual_tokens
+
         block_mask_kwargs = {
-            "seq_lengths": (self.num_actual_tokens, self.total_cache_tokens),
+            "seq_lengths": (q_len, kv_len),
             "kv_num_blocks": kv_num_blocks[None, None],
             "kv_indices": kv_indices[None, None],
             "full_kv_num_blocks": None,
