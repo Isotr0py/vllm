@@ -329,7 +329,9 @@ class TritonAttentionBackend(AttentionBackend):
         return attn_type in (
             AttentionType.DECODER,
             AttentionType.ENCODER,
-            AttentionType.ENCODER_ONLY,
+            # FIXME(Isotr0py): Disable ENCODER_ONLY for now because
+            # bidirectional sliding window kernel has some accuracy issues.
+            # AttentionType.ENCODER_ONLY,
             AttentionType.ENCODER_DECODER,
         )
 
