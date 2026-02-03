@@ -654,10 +654,11 @@ class GroupCoordinator:
         )
 
         # Send object size
-
+        logger.debug(f"Sending object size {size_tensor.item()} bytes to rank {dst}")
         torch.distributed.send(size_tensor, dst=self.ranks[dst], group=self.cpu_group)
 
         # Send object
+        logger.debug(f"Sending object tensor to rank {dst}")
         torch.distributed.send(object_tensor, dst=self.ranks[dst], group=self.cpu_group)
 
         return None
@@ -833,10 +834,14 @@ class GroupCoordinator:
             f"Expecting a dictionary, got {type(tensor_dict)}"
         )
         metadata_list, tensor_list = _split_tensor_dict(tensor_dict)
+        logger.debug(
+            f"Rank {self.rank} sending tensor dict to rank {self.ranks[dst]}: "
+        )
         # `metadata_list` lives in CPU memory.
         # `send_object_list` has serialization & deserialization,
         # all happening on CPU. Therefore, we can use the CPU group.
         self.send_object(metadata_list, dst=dst)
+        logger.debug(f"Rank {self.rank} sent metadata list to rank {self.ranks[dst]}: ")
 
         tensor_keys = [k for k, v in tensor_dict.items() if isinstance(v, torch.Tensor)]
         assert len(tensor_keys) == len(tensor_list)

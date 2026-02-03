@@ -338,6 +338,7 @@ def set_forward_context(
     if need_to_track_batchsize:
         forward_start_time = time.perf_counter()
 
+    logger.debug("set DP metadata")
     dp_metadata: DPMetadata | None = None
     if (
         vllm_config.parallel_config.data_parallel_size > 1
@@ -360,6 +361,9 @@ def set_forward_context(
         dp_metadata = DPMetadata.make(
             vllm_config.parallel_config, num_tokens or 0, num_tokens_across_dp
         )
+    logger.debug("DP metadata set up finished")
+
+    logger.debug(cudagraph_runtime_mode)
 
     # Convenience: if cudagraph is used and num_tokens is given, we can just
     # create a batch descriptor here if not given (there's no harm since if it
@@ -367,6 +371,23 @@ def set_forward_context(
     if cudagraph_runtime_mode != CUDAGraphMode.NONE and num_tokens is not None:
         batch_descriptor = batch_descriptor or BatchDescriptor(num_tokens=num_tokens)
 
+    logger.debug("")
+    # logger.debug(
+    #     "Setting forward context: vllm_config=%s, virtual_engine=%d, "
+    #     "num_tokens=%s, num_tokens_across_dp=%s, "
+    #     "cudagraph_runtime_mode=%s, batch_descriptor=%s, "
+    #     "ubatch_slices=%s, slot_mapping=%s, skip_compiled=%s",
+    #     vllm_config,
+    #     virtual_engine,
+    #     num_tokens,
+    #     num_tokens_across_dp,
+    #     cudagraph_runtime_mode,
+    #     batch_descriptor,
+    #     ubatch_slices,
+    #     slot_mapping,
+    #     skip_compiled,
+    # )
+    logger.debug("Setting forward context ")
     additional_kwargs = current_platform.set_additional_forward_context(
         attn_metadata=attn_metadata,
         vllm_config=vllm_config,
@@ -378,6 +399,7 @@ def set_forward_context(
         batch_descriptor=batch_descriptor,
         ubatch_slices=ubatch_slices,
     )
+    logger.debug("Additional kwargs set up finished")
 
     forward_context = create_forward_context(
         attn_metadata,
@@ -391,9 +413,11 @@ def set_forward_context(
         additional_kwargs,
         skip_compiled,
     )
+    logger.debug("Forward context created")
 
     try:
         with override_forward_context(forward_context):
+            logger.debug("override_forward_context")
             yield
     finally:
         global last_logging_time, batchsize_logging_interval

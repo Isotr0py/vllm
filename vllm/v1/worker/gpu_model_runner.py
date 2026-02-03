@@ -3538,6 +3538,7 @@ class GPUModelRunner(
                 inputs_embeds=inputs_embeds,
                 **model_kwargs,
             )
+            logger.debug("Model forward complete.")
 
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
             if self.use_aux_hidden_state_outputs:
@@ -3548,6 +3549,7 @@ class GPUModelRunner(
                 hidden_states = model_output
                 aux_hidden_states = None
 
+            logger.debug("compute_logits: %s", self.broadcast_pp_output)
             if not self.broadcast_pp_output:
                 # Common case.
                 if not get_pp_group().is_last_rank:
@@ -3573,17 +3575,22 @@ class GPUModelRunner(
                 assert not self.is_pooling_model
 
                 sample_hidden_states = hidden_states[logits_indices]
+                logger.debug(
+                    "get_pp_group().is_last_rank: %s", get_pp_group().is_last_rank
+                )
                 if not get_pp_group().is_last_rank:
                     all_gather_tensors = {
                         "residual": not is_residual_scattered_for_sp(
                             self.vllm_config, num_tokens_padded
                         )
                     }
+                    logger.debug("starting send_tensor_dict")
                     get_pp_group().send_tensor_dict(
                         hidden_states.tensors,
                         all_gather_group=get_tp_group(),
                         all_gather_tensors=all_gather_tensors,
                     )
+                    logger.debug("send_tensor_dict finished")
                     logits = None
                 else:
                     logits = self.model.compute_logits(sample_hidden_states)
@@ -3597,6 +3604,7 @@ class GPUModelRunner(
                 )
                 assert broadcasted is not None
                 logits = broadcasted["logits"]
+        logger.debug("compute_logits finished.")
 
         self.execute_model_state = ExecuteModelState(
             scheduler_output,
