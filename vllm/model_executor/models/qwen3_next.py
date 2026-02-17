@@ -44,7 +44,6 @@ from vllm.model_executor.layers.layernorm import (
 from vllm.model_executor.layers.layernorm import RMSNormGated
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
-    MergedColumnParallelLinear,
     QKVParallelLinear,
     ReplicatedLinear,
     RowParallelLinear,
@@ -407,19 +406,19 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
         self.conv1d.weight.data = self.conv1d.weight.data.unsqueeze(1)
 
         # projection of the input hidden states
-        # Qwen3-Next and Qwen3.5 has a different qkv_proj layout,
-        # we need to create qkvz_proj adaptively here.
-        self.in_proj_qkvz = self.create_qkvz_proj(
-            hidden_size=self.hidden_size,
-            key_dim=self.key_dim,
-            value_dim=self.value_dim,
+        self.projection_size_qkvz = self.key_dim * 2 + self.value_dim * 2
+        self.projection_size_ba = self.num_v_heads * 2
+        self.in_proj_qkvz = ColumnParallelLinear(
+            input_size=self.hidden_size,
+            output_size=self.projection_size_qkvz,
+            bias=False,
             quant_config=quant_config,
             prefix=f"{prefix}.in_proj_qkvz",
         )
         # ba_proj doesn't support blockwise fp8 quantization.
-        self.in_proj_ba = MergedColumnParallelLinear(
+        self.in_proj_ba = ColumnParallelLinear(
             input_size=self.hidden_size,
-            output_sizes=[self.num_v_heads] * 2,
+            output_size=self.projection_size_ba,
             bias=False,
             quant_config=quant_config,
             prefix=f"{prefix}.in_proj_ba",
@@ -495,7 +494,7 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
     ) -> MergedColumnParallelLinear:
         return MergedColumnParallelLinear(
             input_size=hidden_size,
-            output_sizes=[sum((key_dim, key_dim, value_dim, value_dim))],
+            output_sizes=[sum((key_dim, key_dim, value_dim)), value_dim],
             bias=False,
             quant_config=quant_config,
             prefix=f"{prefix}.in_proj_qkvz",
@@ -503,8 +502,8 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
 
     def fix_query_key_value_ordering(
         self,
-        mixed_qkvz: torch.Tensor,
-        mixed_ba: torch.Tensor,
+        mixed_qkvz,
+        mixed_ba,
     ):
         """
         Derives `query`, `key` and `value` tensors from `mixed_qkvzba`.
