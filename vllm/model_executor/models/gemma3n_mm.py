@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import math
 from collections.abc import Iterable, Mapping, Sequence
 from typing import Annotated, Any, Literal
 
@@ -219,6 +220,18 @@ class Gemma3nMultiModalProcessor(BaseMultiModalProcessor[Gemma3nProcessingInfo])
         # the warning.
         if "audios" in mm_data:
             mm_data["audio"] = mm_data.pop("audios")
+
+        # Collect audio waveform lengths before HF processing so we can
+        # compute the per-item standalone frame count after batched processing.
+        audio_items = mm_data.get("audio", [])
+        if not isinstance(audio_items, (list, tuple)):
+            audio_items = [audio_items]
+        audio_lengths: list[int] = []
+        for item in audio_items:
+            # Each item is a (waveform, sample_rate) tuple or bare ndarray.
+            waveform = item[0] if isinstance(item, (tuple, list)) else item
+            audio_lengths.append(len(waveform) if waveform is not None else 0)
+
         processed_outputs = super()._call_hf_processor(
             prompt,
             mm_data,
@@ -227,19 +240,36 @@ class Gemma3nMultiModalProcessor(BaseMultiModalProcessor[Gemma3nProcessingInfo])
         )
 
         if "input_features" in processed_outputs:
-            # Padding enables audio_tower to run in batched mode
-            processed_outputs["input_features_padded"] = processed_outputs[
-                "input_features"
-            ]
+            # Compute per-item standalone frame count so that each item's
+            # cached representation is independent of the other items it was
+            # batched with (batch processing pads all items to T_max, which
+            # would otherwise make per-item features batch-dependent).
+            feature_extractor = self.info.get_feature_extractor()
+            hop_length: int = feature_extractor.hop_length  # 160
+            frame_size: int = feature_extractor.frame_length + 1  # 513
+            pad_to_multiple: int = 128
+
+            per_item_padded: list[torch.Tensor] = []
+            per_item_mask: list[torch.Tensor] = []
+            batch_features = processed_outputs["input_features"]
+            batch_mask = processed_outputs["input_features_mask"]
+            for i, audio_len in enumerate(audio_lengths):
+                padded_len = (
+                    math.ceil(max(audio_len, 1) / pad_to_multiple) * pad_to_multiple
+                )
+                t_standalone = max(0, (padded_len - frame_size) // hop_length + 1)
+                per_item_padded.append(batch_features[i, :t_standalone])
+                per_item_mask.append(batch_mask[i, :t_standalone])
+
+            # Store batch-independent per-item padded features (enables
+            # correct caching and model-level re-batching).
+            processed_outputs["input_features_padded"] = per_item_padded
+            processed_outputs["input_features_mask"] = per_item_mask
 
             # Unpad features here since we need the output of each item to be
             # independent of other items for the cache to work correctly
             unpadded_features = [
-                f[mask]
-                for f, mask in zip(
-                    processed_outputs["input_features"],
-                    processed_outputs["input_features_mask"],
-                )
+                f[mask] for f, mask in zip(per_item_padded, per_item_mask)
             ]
             processed_outputs["input_features"] = unpadded_features
         return processed_outputs
@@ -614,9 +644,52 @@ class Gemma3nForConditionalGeneration(
         self,
         audio_input: Gemma3nAudioInputs,
     ) -> list[torch.Tensor]:
-        # Run on padded features to enable batching
-        input_features = audio_input["input_features_padded"].squeeze(1)
-        input_features_mask = audio_input["input_features_mask"].squeeze(1)
+        # Run on padded features to enable batching.
+        # After caching or when items have different standalone lengths,
+        # input_features_padded may arrive as a list of variable-T tensors.
+        # Re-pad all items to T_max so we can stack them for the audio tower.
+        input_features_padded = audio_input["input_features_padded"]
+        input_features_mask = audio_input["input_features_mask"]
+
+        if isinstance(input_features_padded, list):
+            t_max = max((f.shape[0] for f in input_features_padded), default=0)
+            if t_max == 0:
+                # All audios are empty; stack into a (N, 0, F) tensor.
+                n = len(input_features_padded)
+                f_dim = input_features_padded[0].shape[-1] if n > 0 else 128
+                dev = input_features_padded[0].device if n > 0 else torch.device("cpu")
+                input_features = torch.zeros(
+                    n,
+                    0,
+                    f_dim,
+                    dtype=torch.float32,
+                    device=dev,
+                )
+                input_features_mask = torch.zeros(
+                    n,
+                    0,
+                    dtype=torch.bool,
+                    device=dev,
+                )
+            else:
+                f_dim = input_features_padded[0].shape[-1]
+                dev = input_features_padded[0].device
+                dtype = input_features_padded[0].dtype
+                n = len(input_features_padded)
+                padded = torch.zeros(n, t_max, f_dim, dtype=dtype, device=dev)
+                mask = torch.zeros(n, t_max, dtype=torch.bool, device=dev)
+                for i, (feat, msk) in enumerate(
+                    zip(input_features_padded, input_features_mask)
+                ):
+                    t_i = feat.shape[0]
+                    padded[i, :t_i] = feat
+                    mask[i, :t_i] = msk
+                input_features = padded
+                input_features_mask = mask
+        else:
+            input_features = input_features_padded.squeeze(1)
+            input_features_mask = input_features_mask.squeeze(1)
+
         audio_outputs = self.audio_tower(input_features, ~input_features_mask)
         if isinstance(audio_outputs, tuple):
             # Transformers v4
