@@ -731,16 +731,16 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
         loaded_shard_id: tuple[int, ...] | int | None = None,
     ):
         self.validate_shard_id(loaded_shard_id)
-        # FIXME(Isotr0py): Enable tuple shard_id for BNB quantization.
-        # if isinstance(loaded_shard_id, tuple):
-        #     raise NotImplementedError(
-        #         "Shard id with multiple indices is not supported in weight_loader, "
-        #         "please use weight_loader_v2 instead."
-        #     )
         # Special case for GGUF
         # initialize GGUF param after we know the quantize type
         is_gguf_weight = getattr(param, "is_gguf_weight", False)
         is_gguf_weight_type = getattr(param, "is_gguf_weight_type", False)
+        if isinstance(loaded_shard_id, tuple) and (
+            is_gguf_weight or is_gguf_weight_type
+        ):
+            raise NotImplementedError(
+                "Shard id with multiple indices is not supported for GGUF."
+            )
         if is_gguf_weight_type:
             if loaded_shard_id is not None:
                 param.data[loaded_shard_id].copy_(loaded_weight)
