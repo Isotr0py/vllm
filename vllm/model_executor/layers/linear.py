@@ -788,11 +788,6 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
             )
             current_shard_offset = 0
             use_bitsandbytes_4bit = getattr(param, "use_bitsandbytes_4bit", False)
-            if use_bitsandbytes_4bit and isinstance(loaded_shard_id, tuple):
-                raise NotImplementedError(
-                    "Shard id with multiple indices is not supported "
-                    "for BNB quantization yet."
-                )
             shard_offsets: list[tuple[int, int, int]] = []
             for i, output_size in enumerate(output_sizes):
                 shard_offsets.append((i, current_shard_offset, output_size))
@@ -859,8 +854,17 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
             is_sharded_weight = is_sharded_weight or use_bitsandbytes_4bit
 
             if use_bitsandbytes_4bit:
-                shard_size = loaded_weight.shape[output_dim]
-                shard_offset = loaded_weight.shape[output_dim] * loaded_shard_id
+                # Use proportional mapping based on original (unquantized)
+                # output sizes to correctly handle non-uniform shard sizes
+                # (e.g., key_dim != value_dim in Qwen3.5).
+                index = list(itertools.accumulate([0] + self.output_sizes))
+                orig_offsets = {
+                    str(i): (index[i], size) for i, size in enumerate(self.output_sizes)
+                }
+                orig_offsets["total"] = (self.output_size, 0)
+                shard_size, shard_offset = adjust_bitsandbytes_4bit_shard(
+                    param, orig_offsets, str(loaded_shard_id)
+                )
 
             param_data = param_data.narrow(output_dim, shard_offset, shard_size)
             start_idx = self.tp_rank * shard_size
