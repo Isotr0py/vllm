@@ -392,7 +392,8 @@ def kernel_unified_attention_2d(
             seq_mask = seq_mask & ((query_abs_pos - seq_offset) < SLIDING_WINDOW)
 
         # PrefixLM: extend mask with bidirectional ranges for multimodal tokens.
-        # Applied AFTER sliding window so mm_prefix ranges override SW restriction.
+        # Applied AFTER sliding window. Ranges that exceed the sliding window
+        # are skipped to prevent attention explosion (e.g. Gemma4 vision bidi).
         if USE_MM_PREFIX:
             for i in range(MAX_MM_RANGES):
                 range_start = tl.load(
@@ -403,6 +404,14 @@ def kernel_unified_attention_2d(
                 )
 
                 is_valid = range_start < range_end
+                # Skip bidi for ranges that exceed the sliding window: tokens
+                # outside the window would attend across the full range,
+                # degrading spatial precision. SLIDING_WINDOW is constexpr so
+                # this branch compiles away when there is no sliding window.
+                if SLIDING_WINDOW > 0:
+                    is_valid = is_valid & (
+                        (range_end - range_start + 1) <= SLIDING_WINDOW
+                    )
                 q_in_range = (
                     (query_abs_pos >= range_start)
                     & (query_abs_pos <= range_end)
@@ -799,7 +808,8 @@ def kernel_unified_attention_3d(
             seq_mask = seq_mask & ((query_abs_pos - seq_offset) < SLIDING_WINDOW)
 
         # PrefixLM: extend mask with bidirectional ranges for multimodal tokens.
-        # Applied AFTER sliding window so mm_prefix ranges override SW restriction.
+        # Applied AFTER sliding window. Ranges that exceed the sliding window
+        # are skipped to prevent attention explosion (e.g. Gemma4 vision bidi).
         if USE_MM_PREFIX:
             for i in range(MAX_MM_RANGES):
                 range_start = tl.load(
@@ -810,6 +820,14 @@ def kernel_unified_attention_3d(
                 )
 
                 is_valid = range_start < range_end
+                # Skip bidi for ranges that exceed the sliding window: tokens
+                # outside the window would attend across the full range,
+                # degrading spatial precision. SLIDING_WINDOW is constexpr so
+                # this branch compiles away when there is no sliding window.
+                if SLIDING_WINDOW > 0:
+                    is_valid = is_valid & (
+                        (range_end - range_start + 1) <= SLIDING_WINDOW
+                    )
                 q_in_range = (
                     (query_abs_pos >= range_start)
                     & (query_abs_pos <= range_end)
