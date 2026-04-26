@@ -625,6 +625,44 @@ class DynamicVideoBackend(VideoBackend):
         )
 
 
+@VIDEO_LOADER_REGISTRY.register("qwen3_vl")
+class Qwen3VLVideoBackend(VideoBackend):
+    """Qwen3-VL video pre-sampling backend."""
+
+    @classmethod
+    def compute_frames_index_to_sample(
+        cls,
+        source: VideoSourceMetadata,
+        target: VideoTargetMetadata,
+        **kwargs,
+    ) -> list[int]:
+        # Refer to
+        # https://github.com/huggingface/transformers/blob/8ac2b916b042b1f78b75c9eb941c0f5d2cdd8e10/src/transformers/models/qwen3_vl/video_processing_qwen3_vl.py#L127-L174
+        min_frames = kwargs.get("min_frames", 4)
+        max_frames = kwargs.get("max_frames", 768)
+        total_num_frames = source.total_frames_num
+        num_frames = target.num_frames if target.num_frames > 0 else None
+        fps = target.fps if target.fps > 0 else None
+
+        if fps is not None and num_frames is not None:
+            raise ValueError(
+                "`num_frames` and `fps` are mutually exclusive arguments, "
+                "please use only one!"
+            )
+
+        # If num_frames is not given but fps is, calculate num_frames from fps
+        if num_frames is None and fps is not None:
+            num_frames = int(total_num_frames / source.original_fps * fps)
+            num_frames = min(max(num_frames, min_frames), max_frames, total_num_frames)
+
+        if num_frames is None:
+            num_frames = min(max(total_num_frames, min_frames), max_frames)
+
+        indices = np.linspace(0, total_num_frames - 1, num_frames).round().astype(int)
+
+        return indices.tolist()
+
+
 @VIDEO_LOADER_REGISTRY.register("molmo2")
 class Molmo2VideoBackend(VideoLoader, OpenCVVideoBackendMixin):
     @classmethod
