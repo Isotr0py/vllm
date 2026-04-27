@@ -616,3 +616,50 @@ def top2_sum_gate(
            ep_rank, num_ep_ranks, tp_rank, num_tp_ranks)  # fmt: off
 
     return topk_idx, topk_weights
+
+
+def _top2_sum_gate_fake(
+    logits: torch.Tensor,
+    bias: torch.Tensor,
+    num_topk: int,
+    num_topk_groups: int,
+    num_groups: int,
+    use_shared_as_routed: bool,
+    num_shared_experts: int,
+    routed_scaling_factor: float,
+    ep_rank: int,
+    num_ep_ranks: int,
+    tp_rank: int,
+    num_tp_ranks: int,
+    scoring_func: str,
+    mask: torch.Tensor | None = None,
+    fix_routing_mask: torch.Tensor | None = None,
+    to_physical_map: torch.Tensor | None = None,
+    logical_count: torch.Tensor | None = None,
+    unmapped_topk_idx: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    num_tokens = logits.size(0)
+    num_physical_topk = num_topk + (num_shared_experts if use_shared_as_routed else 0)
+    topk_idx = torch.empty(
+        num_tokens,
+        num_physical_topk,
+        dtype=torch.long,
+        device=logits.device,
+    )
+    topk_weights = torch.empty(
+        num_tokens,
+        num_physical_topk,
+        dtype=torch.float32,
+        device=logits.device,
+    )
+    return topk_idx, topk_weights
+
+
+from vllm.utils.torch_utils import direct_register_custom_op
+
+direct_register_custom_op(
+    op_name="top2_sum_gate",
+    op_func=top2_sum_gate,
+    mutates_args=[],
+    fake_impl=_top2_sum_gate_fake,
+)

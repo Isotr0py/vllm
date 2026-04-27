@@ -809,9 +809,8 @@ class DeepseekV4MoE(nn.Module):
         single GPU kernel.  EP/TP masking is disabled because DeepGEMM
         mega_moe handles expert dispatch internally using global IDs.
         """
-        from vllm.model_executor.layers.fused_moe.ops.top2_sum_gate_kernel import (
-            top2_sum_gate as _tk_top2_sum_gate,
-        )
+        # Trigger registration before calling via torch.ops
+        import vllm.model_executor.layers.fused_moe.ops.top2_sum_gate_kernel  # noqa: F401
 
         bias = (
             self.gate.e_score_correction_bias.data
@@ -822,7 +821,7 @@ class DeepseekV4MoE(nn.Module):
                 device=router_logits.device,
             )
         )
-        topk_idx, topk_weights = _tk_top2_sum_gate(
+        topk_idx, topk_weights = torch.ops.vllm.top2_sum_gate(
             logits=router_logits,
             bias=bias,
             num_topk=self.n_activated_experts,
