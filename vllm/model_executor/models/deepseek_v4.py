@@ -54,6 +54,7 @@ from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.triton_utils import tl, triton
+from vllm.utils.import_utils import has_tilelang
 from vllm.utils.multi_stream_utils import AuxStreamType
 from vllm.utils.torch_utils import direct_register_custom_op
 
@@ -798,6 +799,46 @@ class DeepseekV4MoE(nn.Module):
             router_logits_dtype=torch.float32,
         )
 
+    def _route_with_tile_kernels(
+        self,
+        router_logits: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Route tokens to experts using TileKernels top2_sum_gate.
+
+        Fuses scoring (sqrtsoftplus) + top-K + normalization into a
+        single GPU kernel.  EP/TP masking is disabled because DeepGEMM
+        mega_moe handles expert dispatch internally using global IDs.
+        """
+        from vllm.model_executor.layers.fused_moe.ops.top2_sum_gate_kernel import (
+            top2_sum_gate as _tk_top2_sum_gate,
+        )
+
+        bias = (
+            self.gate.e_score_correction_bias.data
+            if self.gate.e_score_correction_bias is not None
+            else torch.zeros(
+                self.n_routed_experts,
+                dtype=torch.float32,
+                device=router_logits.device,
+            )
+        )
+        topk_idx, topk_weights = _tk_top2_sum_gate(
+            logits=router_logits,
+            bias=bias,
+            num_topk=self.n_activated_experts,
+            num_topk_groups=0,
+            num_groups=0,
+            use_shared_as_routed=False,
+            num_shared_experts=0,
+            routed_scaling_factor=self.routed_scaling_factor,
+            ep_rank=0,
+            num_ep_ranks=1,
+            tp_rank=0,
+            num_tp_ranks=1,
+            scoring_func=self.scoring_func,
+        )
+        return topk_weights, topk_idx
+
     def forward(
         self, hidden_states: torch.Tensor, input_ids: torch.Tensor | None = None
     ) -> torch.Tensor:
@@ -810,20 +851,26 @@ class DeepseekV4MoE(nn.Module):
 
         org_shape = hidden_states.shape
         router_logits, _ = self.gate(hidden_states)
-        topk_weights, topk_ids = fused_topk_bias(
-            hidden_states=hidden_states,
-            gating_output=router_logits,
-            scoring_func=self.scoring_func,
-            e_score_correction_bias=self.gate.e_score_correction_bias.data
-            if self.gate.e_score_correction_bias is not None
-            else None,
-            topk=self.n_activated_experts,
-            renormalize=self.renormalize,
-            indices_type=self.hash_indices_dtype,
-            input_tokens=input_ids,
-            hash_indices_table=self.gate.tid2eid,
-            routed_scaling_factor=self.routed_scaling_factor,
-        )
+
+        is_hash_layer = self.gate.tid2eid is not None
+        if not is_hash_layer and has_tilelang():
+            topk_weights, topk_ids = self._route_with_tile_kernels(router_logits)
+        else:
+            topk_weights, topk_ids = fused_topk_bias(
+                hidden_states=hidden_states,
+                gating_output=router_logits,
+                scoring_func=self.scoring_func,
+                e_score_correction_bias=self.gate.e_score_correction_bias.data
+                if self.gate.e_score_correction_bias is not None
+                else None,
+                topk=self.n_activated_experts,
+                renormalize=self.renormalize,
+                indices_type=self.hash_indices_dtype,
+                input_tokens=input_ids,
+                hash_indices_table=self.gate.tid2eid,
+                routed_scaling_factor=self.routed_scaling_factor,
+            )
+
         activation_clamp = (
             float(self.swiglu_limit) if self.swiglu_limit is not None else None
         )
