@@ -14,12 +14,11 @@ import time
 
 import torch
 
+# Trigger custom-op registration
+import vllm.model_executor.layers.fused_moe.ops.top2_sum_gate_kernel  # noqa: F401
 from vllm.model_executor.layers.fused_moe.router.fused_topk_bias_router import (
     fused_topk_bias,
 )
-
-# Trigger custom-op registration
-import vllm.model_executor.layers.fused_moe.ops.top2_sum_gate_kernel  # noqa: F401
 
 
 def bench(
@@ -54,8 +53,9 @@ def main():
     parser.add_argument("--num-experts", type=int, default=256)
     parser.add_argument("--top-k", type=int, default=8)
     parser.add_argument("--scaling-factor", type=float, default=1.0)
-    parser.add_argument("--with-bias", action="store_true",
-                        help="Use non-zero e_score_correction_bias")
+    parser.add_argument(
+        "--with-bias", action="store_true", help="Use non-zero e_score_correction_bias"
+    )
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--iters", type=int, default=100)
     args = parser.parse_args()
@@ -68,21 +68,26 @@ def main():
 
     token_counts = [1, 4, 16, 64, 128, 256, 512, 1024, 2048, 4096]
 
-    print(f"DeepSeek-V4 MoE Routing Benchmark")
-    print(f"  num_experts={num_experts}, top_k={top_k}, "
-          f"scoring=sqrtsoftplus, scaling={scaling_factor}")
+    print("DeepSeek-V4 MoE Routing Benchmark")
+    print(
+        f"  num_experts={num_experts}, top_k={top_k}, "
+        f"scoring=sqrtsoftplus, scaling={scaling_factor}"
+    )
     print(f"  with_bias={args.with_bias}, renormalize={renormalize}")
     print()
-    print(f"{'Tokens':>8s} | {'fused_topk_bias':>18s} | {'top2_sum_gate':>18s} | "
-          f"{'Speedup':>8s}")
+    print(
+        f"{'Tokens':>8s} | {'fused_topk_bias':>18s} | {'top2_sum_gate':>18s} | "
+        f"{'Speedup':>8s}"
+    )
     print("-" * 68)
 
     for num_tokens in token_counts:
         # Pad to multiple of 128 for top2_sum_gate alignment
         num_tokens_padded = ((num_tokens + 127) // 128) * 128
 
-        logits = torch.randn(num_tokens_padded, num_experts,
-                             dtype=torch.float32, device=device)
+        logits = torch.randn(
+            num_tokens_padded, num_experts, dtype=torch.float32, device=device
+        )
         bias_tensor = (
             torch.randn(num_experts, dtype=torch.float32, device=device) * 0.1
             if args.with_bias
@@ -92,8 +97,9 @@ def main():
         # ---- fused_topk_bias (existing) ----
         def run_fused():
             fused_topk_bias(
-                hidden_states=torch.empty(num_tokens_padded, 1,
-                                          dtype=torch.float16, device=device),
+                hidden_states=torch.empty(
+                    num_tokens_padded, 1, dtype=torch.float16, device=device
+                ),
                 gating_output=logits,
                 scoring_func="sqrtsoftplus",
                 e_score_correction_bias=bias_tensor if args.with_bias else None,
@@ -125,8 +131,10 @@ def main():
         t_tk = bench("top2_sum_gate", run_tk, args.warmup, args.iters)
 
         speedup = t_fused / t_tk if t_tk > 0 else float("inf")
-        print(f"{num_tokens:>8d} | {t_fused:>15.1f} us | {t_tk:>15.1f} us | "
-              f"{speedup:>7.2f}x")
+        print(
+            f"{num_tokens:>8d} | {t_fused:>15.1f} us | {t_tk:>15.1f} us | "
+            f"{speedup:>7.2f}x"
+        )
 
 
 if __name__ == "__main__":
