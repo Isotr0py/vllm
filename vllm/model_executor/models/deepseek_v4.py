@@ -111,7 +111,80 @@ class DeepseekV4MLP(nn.Module):
         else:
             self.act_fn = SiluAndMul()
 
+        self.swiglu_limit = swiglu_limit
+        self.reduce_results = reduce_results
+        self._use_fused_fp8 = False
+
+    def _maybe_enable_fused_fp8(self) -> None:
+        """Check if the fused SwiGLU+FP8 path is available and cache result."""
+        if self._use_fused_fp8:
+            return
+        if not has_tilelang():
+            return
+        # Only works when down_proj has FP8 weights (deepseek_v4_fp8 quant).
+        weight = getattr(self.down_proj, "weight", None)
+        if weight is None or weight.dtype != torch.float8_e4m3fn:
+            return
+        if not hasattr(self.down_proj, "weight_scale_inv"):
+            return
+        self._use_fused_fp8 = True
+
+    def _forward_fused_fp8(self, x: torch.Tensor) -> torch.Tensor:
+        """SwiGLU + FP8 quant + FP8 GEMM, bypassing the standard linear path.
+
+        Uses the fused TileLang kernel for SwiGLU + per-token FP8 quantization,
+        then calls fp8_gemm_nt_op directly with the pre-quantized output.
+        """
+        from vllm.distributed import (
+            tensor_model_parallel_all_reduce,
+            get_tensor_model_parallel_world_size,
+        )
+
+        # Trigger custom-op registration
+        import vllm.model_executor.layers.fused_moe.ops.swiglu_fp8_quant_kernel  # noqa: F401
+
+        gate_up, _ = self.gate_up_proj(x)
+
+        # Fused SwiGLU + per-token per-128-channel FP8 quantization
+        clamp_val = (
+            float(self.swiglu_limit) if self.swiglu_limit is not None else None
+        )
+        x_fp8, x_sf = torch.ops.vllm.swiglu_fp8_quant(
+            x=gate_up,
+            fmt="e4m3",
+            num_per_channels=128,
+            swiglu_clamp_value=clamp_val,
+        )
+
+        # Get FP8 weight and block scales from down_proj
+        weight = self.down_proj.weight                    # [hidden, inter//tp] FP8
+        weight_scale = self.down_proj.weight_scale_inv    # FP32 block scales
+
+        # Direct FP8 GEMM
+        num_tokens = x_fp8.shape[0]
+        hidden_size = weight.shape[0]
+        output = torch.empty(
+            (num_tokens, hidden_size),
+            dtype=torch.bfloat16,
+            device=x.device,
+        )
+        torch.ops.vllm.fp8_gemm_nt_op(
+            x_fp8, x_sf, weight, weight_scale, output, False,
+        )
+
+        # TP allreduce (same logic as RowParallelLinear)
+        if self.reduce_results:
+            tp_size = get_tensor_model_parallel_world_size()
+            if tp_size > 1:
+                output = tensor_model_parallel_all_reduce(output)
+
+        return output
+
     def forward(self, x):
+        self._maybe_enable_fused_fp8()
+        if self._use_fused_fp8:
+            return self._forward_fused_fp8(x)
+
         gate_up, _ = self.gate_up_proj(x)
         x = self.act_fn(gate_up)
         x, _ = self.down_proj(x)

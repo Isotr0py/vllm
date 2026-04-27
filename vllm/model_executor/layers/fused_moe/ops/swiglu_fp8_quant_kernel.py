@@ -435,3 +435,44 @@ def swiglu_forward_and_per_token_cast(
 
     out_sf = _cast_epilogue(out_sf, num_expanded_tokens, hidden, out_config)
     return out, out_sf
+
+
+# ---------------------------------------------------------------------------
+# Custom op registration (torch.ops.vllm.swiglu_fp8_quant)
+# ---------------------------------------------------------------------------
+
+def _swiglu_fp8_quant_fake(
+    x: torch.Tensor,
+    fmt: str,
+    num_per_channels: int,
+    pos_to_token_topk: Optional[torch.Tensor] = None,
+    topk_weights: Optional[torch.Tensor] = None,
+    pos_to_expert: Optional[torch.Tensor] = None,
+    use_tma_aligned_col_major_sf: bool = False,
+    round_sf: bool = False,
+    use_packed_ue8m0: bool = False,
+    swiglu_clamp_value: Optional[float] = None,
+    clamped_count: Optional[torch.Tensor] = None,
+    sf_clamp_min: Optional[float] = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    num_expanded_tokens = x.size(0)
+    hidden = x.size(1) // 2
+    out = torch.empty(
+        num_expanded_tokens, hidden,
+        dtype=torch.float8_e4m3fn, device=x.device,
+    )
+    out_sf = torch.empty(
+        num_expanded_tokens, _ceil_div(hidden, num_per_channels),
+        dtype=torch.float32, device=x.device,
+    )
+    return out, out_sf
+
+
+from vllm.utils.torch_utils import direct_register_custom_op
+
+direct_register_custom_op(
+    op_name="swiglu_fp8_quant",
+    op_func=swiglu_forward_and_per_token_cast,
+    mutates_args=[],
+    fake_impl=_swiglu_fp8_quant_fake,
+)
