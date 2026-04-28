@@ -461,10 +461,22 @@ def _swiglu_fp8_quant_fake(
         num_expanded_tokens, hidden,
         dtype=torch.float8_e4m3fn, device=x.device,
     )
-    out_sf = torch.empty(
-        num_expanded_tokens, _ceil_div(hidden, num_per_channels),
-        dtype=torch.float32, device=x.device,
-    )
+    num_groups = _ceil_div(hidden, num_per_channels)
+    if use_packed_ue8m0:
+        # Packed UE8M0: col-major strided int32 matching per_token_group_quant_fp8_packed_for_deepgemm
+        k_packed = _ceil_div(num_groups, 4)
+        tma_aligned_mn = _align(num_expanded_tokens, 4)
+        out_sf = torch.empty_strided(
+            (num_expanded_tokens, k_packed),
+            (1, tma_aligned_mn),
+            dtype=torch.int32,
+            device=x.device,
+        )
+    else:
+        out_sf = torch.empty(
+            num_expanded_tokens, num_groups,
+            dtype=torch.float32, device=x.device,
+        )
     return out, out_sf
 
 

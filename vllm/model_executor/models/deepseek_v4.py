@@ -54,6 +54,7 @@ from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.triton_utils import tl, triton
+from vllm.utils.deep_gemm import is_deep_gemm_e8m0_used
 from vllm.utils.import_utils import has_tilelang
 from vllm.utils.multi_stream_utils import AuxStreamType
 from vllm.utils.torch_utils import direct_register_custom_op
@@ -134,6 +135,10 @@ class DeepseekV4MLP(nn.Module):
 
         Uses the fused TileLang kernel for SwiGLU + per-token FP8 quantization,
         then calls fp8_gemm_nt_op directly with the pre-quantized output.
+
+        On Blackwell (sm_100), DeepGEMM requires packed UE8M0 TMA-aligned
+        activation scales. The swiglu_fp8_quant kernel produces this layout
+        when use_packed_ue8m0=True, matching per_token_group_quant_fp8_packed_for_deepgemm.
         """
         from vllm.distributed import (
             tensor_model_parallel_all_reduce,
@@ -145,7 +150,13 @@ class DeepseekV4MLP(nn.Module):
 
         gate_up, _ = self.gate_up_proj(x)
 
-        # Fused SwiGLU + per-token per-128-channel FP8 quantization
+        # Fused SwiGLU + per-token per-128-channel FP8 quantization.
+        # On Blackwell, use packed UE8M0 TMA-aligned col-major scales to match
+        # what DeepGEMM expects (disable_ue8m0_cast=False path).
+        use_ue8m0 = (
+            is_deep_gemm_e8m0_used()
+            and current_platform.is_device_capability_family(100)
+        )
         clamp_val = (
             float(self.swiglu_limit) if self.swiglu_limit is not None else None
         )
@@ -154,11 +165,14 @@ class DeepseekV4MLP(nn.Module):
             fmt="e4m3",
             num_per_channels=128,
             swiglu_clamp_value=clamp_val,
+            use_packed_ue8m0=use_ue8m0,
+            use_tma_aligned_col_major_sf=use_ue8m0,
+            round_sf=use_ue8m0,
         )
 
         # Get FP8 weight and block scales from down_proj
         weight = self.down_proj.weight                    # [hidden, inter//tp] FP8
-        weight_scale = self.down_proj.weight_scale_inv    # FP32 block scales
+        weight_scale = self.down_proj.weight_scale_inv    # post-processed block scales
 
         # Direct FP8 GEMM
         num_tokens = x_fp8.shape[0]
@@ -169,7 +183,7 @@ class DeepseekV4MLP(nn.Module):
             device=x.device,
         )
         torch.ops.vllm.fp8_gemm_nt_op(
-            x_fp8, x_sf, weight, weight_scale, output, False,
+            x_fp8, x_sf, weight, weight_scale, output, use_ue8m0,
         )
 
         # TP allreduce (same logic as RowParallelLinear)
@@ -925,23 +939,23 @@ class DeepseekV4MoE(nn.Module):
         router_logits, _ = self.gate(hidden_states)
 
         is_hash_layer = self.gate.tid2eid is not None
-        if not is_hash_layer and has_tilelang():
-            topk_weights, topk_ids = self._route_with_tile_kernels(router_logits)
-        else:
-            topk_weights, topk_ids = fused_topk_bias(
-                hidden_states=hidden_states,
-                gating_output=router_logits,
-                scoring_func=self.scoring_func,
-                e_score_correction_bias=self.gate.e_score_correction_bias.data
-                if self.gate.e_score_correction_bias is not None
-                else None,
-                topk=self.n_activated_experts,
-                renormalize=self.renormalize,
-                indices_type=self.hash_indices_dtype,
-                input_tokens=input_ids,
-                hash_indices_table=self.gate.tid2eid,
-                routed_scaling_factor=self.routed_scaling_factor,
-            )
+        # if not is_hash_layer and has_tilelang():
+        #     topk_weights, topk_ids = self._route_with_tile_kernels(router_logits)
+        # else:
+        topk_weights, topk_ids = fused_topk_bias(
+            hidden_states=hidden_states,
+            gating_output=router_logits,
+            scoring_func=self.scoring_func,
+            e_score_correction_bias=self.gate.e_score_correction_bias.data
+            if self.gate.e_score_correction_bias is not None
+            else None,
+            topk=self.n_activated_experts,
+            renormalize=self.renormalize,
+            indices_type=self.hash_indices_dtype,
+            input_tokens=input_ids,
+            hash_indices_table=self.gate.tid2eid,
+            routed_scaling_factor=self.routed_scaling_factor,
+        )
 
         activation_clamp = (
             float(self.swiglu_limit) if self.swiglu_limit is not None else None
