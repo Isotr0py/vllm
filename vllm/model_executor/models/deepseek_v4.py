@@ -131,22 +131,13 @@ class DeepseekV4MLP(nn.Module):
         self._use_fused_fp8 = True
 
     def _forward_fused_fp8(self, x: torch.Tensor) -> torch.Tensor:
-        """SwiGLU + FP8 quant + FP8 GEMM, bypassing the standard linear path.
-
-        Uses the fused TileLang kernel for SwiGLU + per-token FP8 quantization,
-        then calls fp8_gemm_nt_op directly with the pre-quantized output.
-
-        On Blackwell (sm_100), DeepGEMM requires packed UE8M0 TMA-aligned
-        activation scales. The swiglu_fp8_quant kernel produces this layout
-        when use_packed_ue8m0=True, matching per_token_group_quant_fp8_packed_for_deepgemm.
-        """
-        from vllm.distributed import (
-            tensor_model_parallel_all_reduce,
-            get_tensor_model_parallel_world_size,
-        )
-
+        """SwiGLU + FP8 quant + FP8 GEMM, bypassing the standard linear path"""
         # Trigger custom-op registration
         import vllm.model_executor.layers.fused_moe.ops.swiglu_fp8_quant_kernel  # noqa: F401
+        from vllm.distributed import (
+            get_tensor_model_parallel_world_size,
+            tensor_model_parallel_all_reduce,
+        )
 
         gate_up, _ = self.gate_up_proj(x)
 
@@ -157,9 +148,7 @@ class DeepseekV4MLP(nn.Module):
             is_deep_gemm_e8m0_used()
             and current_platform.is_device_capability_family(100)
         )
-        clamp_val = (
-            float(self.swiglu_limit) if self.swiglu_limit is not None else None
-        )
+        clamp_val = float(self.swiglu_limit) if self.swiglu_limit is not None else None
         x_fp8, x_sf = torch.ops.vllm.swiglu_fp8_quant(
             x=gate_up,
             fmt="e4m3",
@@ -171,8 +160,8 @@ class DeepseekV4MLP(nn.Module):
         )
 
         # Get FP8 weight and block scales from down_proj
-        weight = self.down_proj.weight                    # [hidden, inter//tp] FP8
-        weight_scale = self.down_proj.weight_scale_inv    # post-processed block scales
+        weight = self.down_proj.weight  # [hidden, inter//tp] FP8
+        weight_scale = self.down_proj.weight_scale_inv  # post-processed block scales
 
         # Direct FP8 GEMM
         num_tokens = x_fp8.shape[0]
@@ -183,7 +172,12 @@ class DeepseekV4MLP(nn.Module):
             device=x.device,
         )
         torch.ops.vllm.fp8_gemm_nt_op(
-            x_fp8, x_sf, weight, weight_scale, output, use_ue8m0,
+            x_fp8,
+            x_sf,
+            weight,
+            weight_scale,
+            output,
+            use_ue8m0,
         )
 
         # TP allreduce (same logic as RowParallelLinear)
@@ -886,45 +880,6 @@ class DeepseekV4MoE(nn.Module):
             router_logits_dtype=torch.float32,
         )
 
-    def _route_with_tile_kernels(
-        self,
-        router_logits: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Route tokens to experts using TileKernels top2_sum_gate.
-
-        Fuses scoring (sqrtsoftplus) + top-K + normalization into a
-        single GPU kernel.  EP/TP masking is disabled because DeepGEMM
-        mega_moe handles expert dispatch internally using global IDs.
-        """
-        # Trigger registration before calling via torch.ops
-        import vllm.model_executor.layers.fused_moe.ops.top2_sum_gate_kernel  # noqa: F401
-
-        bias = (
-            self.gate.e_score_correction_bias.data
-            if self.gate.e_score_correction_bias is not None
-            else torch.zeros(
-                self.n_routed_experts,
-                dtype=torch.float32,
-                device=router_logits.device,
-            )
-        )
-        topk_idx, topk_weights = torch.ops.vllm.top2_sum_gate(
-            logits=router_logits,
-            bias=bias,
-            num_topk=self.n_activated_experts,
-            num_topk_groups=0,
-            num_groups=0,
-            use_shared_as_routed=False,
-            num_shared_experts=0,
-            routed_scaling_factor=self.routed_scaling_factor,
-            ep_rank=0,
-            num_ep_ranks=1,
-            tp_rank=0,
-            num_tp_ranks=1,
-            scoring_func=self.scoring_func,
-        )
-        return topk_weights, topk_idx
-
     def forward(
         self, hidden_states: torch.Tensor, input_ids: torch.Tensor | None = None
     ) -> torch.Tensor:
@@ -938,10 +893,6 @@ class DeepseekV4MoE(nn.Module):
         org_shape = hidden_states.shape
         router_logits, _ = self.gate(hidden_states)
 
-        is_hash_layer = self.gate.tid2eid is not None
-        # if not is_hash_layer and has_tilelang():
-        #     topk_weights, topk_ids = self._route_with_tile_kernels(router_logits)
-        # else:
         topk_weights, topk_ids = fused_topk_bias(
             hidden_states=hidden_states,
             gating_output=router_logits,
