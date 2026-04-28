@@ -6,8 +6,8 @@
 Inlines all TileKernels dependencies (utils, quant/common, config) so that
 only ``tilelang`` is required as an external package.
 """
-from dataclasses import dataclass, replace
-from typing import Optional, Union
+
+from dataclasses import dataclass
 
 import tilelang
 import tilelang.language as T
@@ -15,10 +15,10 @@ import torch
 from tilelang.contrib import nvcc
 from tilelang.utils.target import determine_target
 
-
 # ---------------------------------------------------------------------------
 # Inline: tile_kernels.utils
 # ---------------------------------------------------------------------------
+
 
 def _ceil_div(x: int, y: int) -> int:
     return (x + y - 1) // y
@@ -39,7 +39,7 @@ def _is_power_of_two(x: int) -> bool:
 import functools
 
 
-@functools.lru_cache(maxsize=None)
+@functools.cache
 def _get_device_num_sms() -> int:
     prop = torch.cuda.get_device_properties(torch.cuda.current_device())
     return prop.multi_processor_count
@@ -77,7 +77,11 @@ class _BaseCastConfig:
 
     @property
     def dtype(self) -> T.dtype:
-        return T.dtype(self.torch_dtype) if self.torch_dtype != torch.int8 else T.float4_e2m1fn
+        return (
+            T.dtype(self.torch_dtype)
+            if self.torch_dtype != torch.int8
+            else T.float4_e2m1fn
+        )
 
     @property
     def sf_torch_dtype(self) -> torch.dtype:
@@ -91,7 +95,7 @@ class _BaseCastConfig:
 @dataclass(frozen=True)
 class _CastOutputConfig(_BaseCastConfig):
     round_sf: bool = False
-    custom_clamp_min_value: Optional[float] = None
+    custom_clamp_min_value: float | None = None
 
     @property
     def clamp_min_value(self) -> float:
@@ -102,7 +106,7 @@ class _CastOutputConfig(_BaseCastConfig):
         elif self.dtype == T.float4_e2m1fn:
             return T.max_value(self.dtype) * (2**-126)
         else:
-            raise ValueError(f'Unsupported dtype {self.dtype}')
+            raise ValueError(f"Unsupported dtype {self.dtype}")
 
 
 def _get_cast_output_config(
@@ -111,13 +115,13 @@ def _get_cast_output_config(
     use_tma_aligned_col_major_sf: bool = False,
     round_sf: bool = False,
     use_packed_ue8m0: bool = False,
-    custom_clamp_min_value: Optional[float] = None,
+    custom_clamp_min_value: float | None = None,
 ) -> _CastOutputConfig:
-    assert fmt in ('e5m6', 'e4m3', 'e2m1')
+    assert fmt in ("e5m6", "e4m3", "e2m1")
     mapping = {
-        'e5m6': torch.uint32,
-        'e4m3': torch.float8_e4m3fn,
-        'e2m1': torch.int8,
+        "e5m6": torch.uint32,
+        "e4m3": torch.float8_e4m3fn,
+        "e2m1": torch.int8,
     }
     return _CastOutputConfig(
         torch_dtype=mapping[fmt],
@@ -135,13 +139,17 @@ def _get_sf_shape(shape: tuple[int, int], config: _BaseCastConfig) -> tuple[int,
     if config.use_packed_ue8m0:
         num_block_m = num_block_m * 4
         num_block_k = _ceil_div(num_block_k, 4)
-    return (num_block_k, num_block_m) if config.use_tma_aligned_col_major_sf else (num_block_m, num_block_k)
+    return (
+        (num_block_k, num_block_m)
+        if config.use_tma_aligned_col_major_sf
+        else (num_block_m, num_block_k)
+    )
 
 
 def _alloc_scaling_factors(
     shape: tuple[int, int],
     out_config: _BaseCastConfig,
-    device: torch.device = 'cuda',
+    device: torch.device = "cuda",
 ) -> torch.Tensor:
     sf_shape = _get_sf_shape(shape, out_config)
     aligned_sf_shape = sf_shape[1]
@@ -226,7 +234,7 @@ def _get_swiglu_forward_and_per_token_cast_kernel(
     count_clamp: bool,
     in_dtype: T.dtype,
     out_config: _CastOutputConfig,
-    num_sms: Optional[int],
+    num_sms: int | None,
 ):
     num_elems_per_block = 4096
     num_threads = 256
@@ -235,7 +243,7 @@ def _get_swiglu_forward_and_per_token_cast_kernel(
     TILE_X = 1
     TILE_Y = num_per_channels
 
-    while TILE_Y * 2 <= num_elems_per_block and hidden % (TILE_Y * 2) == 0:
+    while num_elems_per_block >= TILE_Y * 2 and hidden % (TILE_Y * 2) == 0:
         TILE_Y *= 2
 
     while TILE_X * TILE_Y % num_threads != 0:
@@ -246,14 +254,14 @@ def _get_swiglu_forward_and_per_token_cast_kernel(
             TILE_Y = hidden
 
         if _is_power_of_two(TILE_Y):
-            while TILE_X * TILE_Y * 2 <= num_elems_per_block:
+            while num_elems_per_block >= TILE_X * TILE_Y * 2:
                 TILE_X *= 2
 
-    num_expanded_tokens = T.dynamic('num_expanded_tokens')
-    num_tokens = T.dynamic('num_tokens')
-    num_topk = T.dynamic('num_topk')
+    num_expanded_tokens = T.dynamic("num_expanded_tokens")
+    num_tokens = T.dynamic("num_tokens")
+    num_topk = T.dynamic("num_topk")
     sf_shape = _get_sf_shape((num_expanded_tokens, hidden), out_config)
-    sf_stride = T.dynamic('sf_stride')
+    sf_stride = T.dynamic("sf_stride")
 
     num_blocks = T.ceildiv(num_expanded_tokens, TILE_X) * T.ceildiv(hidden, TILE_Y)
     if count_clamp:
@@ -277,26 +285,35 @@ def _get_swiglu_forward_and_per_token_cast_kernel(
 
             topk_weights_1d = T.reshape(topk_weights, (num_tokens * num_topk,))
             x_fragment = T.alloc_fragment((TILE_X, TILE_Y), T.float32)
-            x_fragment_reshaped = T.reshape(x_fragment, [TILE_X, num_groups, num_per_channels])
+            x_fragment_reshaped = T.reshape(
+                x_fragment, [TILE_X, num_groups, num_per_channels]
+            )
             xl_fragment = T.alloc_fragment((TILE_X, TILE_Y), in_dtype)
             xr_fragment = T.alloc_fragment((TILE_X, TILE_Y), in_dtype)
 
-            count_silu = T.alloc_reducer((1,), T.int64, 'sum', replication='all')
-            count_upper = T.alloc_reducer((1,), T.int64, 'sum', replication='all')
-            count_lower = T.alloc_reducer((1,), T.int64, 'sum', replication='all')
+            count_silu = T.alloc_reducer((1,), T.int64, "sum", replication="all")
+            count_upper = T.alloc_reducer((1,), T.int64, "sum", replication="all")
+            count_lower = T.alloc_reducer((1,), T.int64, "sum", replication="all")
 
             T.fill(count_silu, 0)
             T.fill(count_upper, 0)
             T.fill(count_lower, 0)
 
             if count_clamp:
-                upper = T.ceildiv(T.ceildiv(num_expanded_tokens, TILE_X) * T.ceildiv(hidden, TILE_Y) - pid, num_blocks)
+                upper = T.ceildiv(
+                    T.ceildiv(num_expanded_tokens, TILE_X) * T.ceildiv(hidden, TILE_Y)
+                    - pid,
+                    num_blocks,
+                )
             else:
                 upper = 1
 
             for iter in T.serial(upper):
                 pid_iter = iter * num_blocks + pid
-                pid_x, pid_y = pid_iter // T.ceildiv(hidden, TILE_Y), pid_iter % T.ceildiv(hidden, TILE_Y)
+                pid_x, pid_y = (
+                    pid_iter // T.ceildiv(hidden, TILE_Y),
+                    pid_iter % T.ceildiv(hidden, TILE_Y),
+                )
 
                 topk_weights_fragment = T.alloc_fragment((TILE_X,), T.float32)
                 pos_to_expert_fragment = T.alloc_fragment((TILE_X,), T.int32)
@@ -314,11 +331,19 @@ def _get_swiglu_forward_and_per_token_cast_kernel(
                     for i in T.Parallel(TILE_X):
                         pos_to_expert_fragment[i] = pos_to_expert[pid_x * TILE_X + i]
 
-                if not with_pos_to_expert or TILE_X != 1 or pos_to_expert_fragment[0] >= 0:
+                if (
+                    not with_pos_to_expert
+                    or TILE_X != 1
+                    or pos_to_expert_fragment[0] >= 0
+                ):
                     for i, j in T.Parallel(TILE_X, TILE_Y):
                         if (not with_pos_to_expert) or pos_to_expert_fragment[i] >= 0:
-                            xl_fragment[i, j] = x[pid_x * TILE_X + i, pid_y * TILE_Y + j]
-                            xr_fragment[i, j] = x[pid_x * TILE_X + i, pid_y * TILE_Y + j + hidden]
+                            xl_fragment[i, j] = x[
+                                pid_x * TILE_X + i, pid_y * TILE_Y + j
+                            ]
+                            xr_fragment[i, j] = x[
+                                pid_x * TILE_X + i, pid_y * TILE_Y + j + hidden
+                            ]
 
                     for i, j in T.Parallel(TILE_X, TILE_Y):
                         if (not with_pos_to_expert) or pos_to_expert_fragment[i] >= 0:
@@ -329,19 +354,33 @@ def _get_swiglu_forward_and_per_token_cast_kernel(
                             if use_clamp:
                                 if count_clamp:
                                     clamp_silu = val_l > swiglu_clamp_value
-                                    val_l = T.Select(clamp_silu, swiglu_clamp_value, val_l)
+                                    val_l = T.Select(
+                                        clamp_silu, swiglu_clamp_value, val_l
+                                    )
                                     count_silu[0] += clamp_silu
                                     clamp_upper = val_r > swiglu_clamp_value
                                     clamp_lower = val_r < -swiglu_clamp_value
-                                    val_r = T.Select(clamp_upper, swiglu_clamp_value, val_r)
-                                    val_r = T.Select(clamp_lower, -swiglu_clamp_value, val_r)
+                                    val_r = T.Select(
+                                        clamp_upper, swiglu_clamp_value, val_r
+                                    )
+                                    val_r = T.Select(
+                                        clamp_lower, -swiglu_clamp_value, val_r
+                                    )
                                     count_upper[0] += clamp_upper
                                     count_lower[0] += clamp_lower
                                 else:
                                     val_l = T.min(val_l, swiglu_clamp_value)
-                                    val_r = T.max(T.min(val_r, swiglu_clamp_value), -swiglu_clamp_value)
+                                    val_r = T.max(
+                                        T.min(val_r, swiglu_clamp_value),
+                                        -swiglu_clamp_value,
+                                    )
                             if with_weight:
-                                val = val_l / (1 + T.exp(-val_l)) * val_r * topk_weights_fragment[i]
+                                val = (
+                                    val_l
+                                    / (1 + T.exp(-val_l))
+                                    * val_r
+                                    * topk_weights_fragment[i]
+                                )
                             else:
                                 val = val_l / (1 + T.exp(-val_l)) * val_r
                             x_fragment[i, j] = val
@@ -349,7 +388,9 @@ def _get_swiglu_forward_and_per_token_cast_kernel(
                     T.reduce_absmax(x_fragment_reshaped, sf_inv_fragment, dim=2)
                     for i, j in T.Parallel(TILE_X, num_groups):
                         if (not with_pos_to_expert) or pos_to_expert_fragment[i] >= 0:
-                            sf, sf_inv = _get_sf_and_inv(sf_inv_fragment[i, j], out_config)
+                            sf, sf_inv = _get_sf_and_inv(
+                                sf_inv_fragment[i, j], out_config
+                            )
                             x_idx = pid_x * TILE_X + i
                             y_idx = pid_y * num_groups + j
                             _store_sf(out_sf, sf, x_idx, y_idx, out_config)
@@ -357,7 +398,10 @@ def _get_swiglu_forward_and_per_token_cast_kernel(
 
                     for i, j in T.Parallel(TILE_X, TILE_Y):
                         if (not with_pos_to_expert) or pos_to_expert_fragment[i] >= 0:
-                            out_fragment[i, j] = x_fragment[i, j] * sf_inv_fragment[i, j // num_per_channels]
+                            out_fragment[i, j] = (
+                                x_fragment[i, j]
+                                * sf_inv_fragment[i, j // num_per_channels]
+                            )
                     T.copy(out_fragment, out[pid_x * TILE_X, pid_y * TILE_Y])
 
             if count_clamp:
@@ -382,15 +426,15 @@ def swiglu_forward_and_per_token_cast(
     x: torch.Tensor,
     fmt: str,
     num_per_channels: int,
-    pos_to_token_topk: Optional[torch.Tensor] = None,
-    topk_weights: Optional[torch.Tensor] = None,
-    pos_to_expert: Optional[torch.Tensor] = None,
+    pos_to_token_topk: torch.Tensor | None = None,
+    topk_weights: torch.Tensor | None = None,
+    pos_to_expert: torch.Tensor | None = None,
     use_tma_aligned_col_major_sf: bool = False,
     round_sf: bool = False,
     use_packed_ue8m0: bool = False,
-    swiglu_clamp_value: Optional[float] = None,
-    clamped_count: Optional[torch.Tensor] = None,
-    sf_clamp_min: Optional[float] = None,
+    swiglu_clamp_value: float | None = None,
+    clamped_count: torch.Tensor | None = None,
+    sf_clamp_min: float | None = None,
 ) -> QuantTensor:
     """Fuse SwiGLU forward pass with per-token FP8 quantization.
 
@@ -409,11 +453,15 @@ def swiglu_forward_and_per_token_cast(
 
     assert hidden % 128 == 0
     assert num_per_channels == 128 or num_per_channels == hidden
-    assert fmt == 'e4m3'
+    assert fmt == "e4m3"
 
     out_config = _get_cast_output_config(
-        fmt, (1, num_per_channels), use_tma_aligned_col_major_sf, round_sf,
-        use_packed_ue8m0, custom_clamp_min_value=sf_clamp_min,
+        fmt,
+        (1, num_per_channels),
+        use_tma_aligned_col_major_sf,
+        round_sf,
+        use_packed_ue8m0,
+        custom_clamp_min_value=sf_clamp_min,
     )
     kernel = _get_swiglu_forward_and_per_token_cast_kernel(
         hidden,
@@ -426,12 +474,22 @@ def swiglu_forward_and_per_token_cast(
         num_sms=_get_num_sms() if clamped_count is not None else None,
     )
 
-    out = torch.empty((num_expanded_tokens, hidden), dtype=torch.float8_e4m3fn, device='cuda')
+    out = torch.empty(
+        (num_expanded_tokens, hidden), dtype=torch.float8_e4m3fn, device="cuda"
+    )
     out_sf = _alloc_scaling_factors((num_expanded_tokens, hidden), out_config)
     swiglu_clamp_value = 0 if swiglu_clamp_value is None else swiglu_clamp_value
     if num_expanded_tokens > 0:
-        kernel(x, out, out_sf, pos_to_token_topk, topk_weights, pos_to_expert,
-               clamped_count, swiglu_clamp_value)
+        kernel(
+            x,
+            out,
+            out_sf,
+            pos_to_token_topk,
+            topk_weights,
+            pos_to_expert,
+            clamped_count,
+            swiglu_clamp_value,
+        )
 
     out_sf = _cast_epilogue(out_sf, num_expanded_tokens, hidden, out_config)
     return out, out_sf
@@ -441,25 +499,28 @@ def swiglu_forward_and_per_token_cast(
 # Custom op registration (torch.ops.vllm.swiglu_fp8_quant)
 # ---------------------------------------------------------------------------
 
+
 def _swiglu_fp8_quant_fake(
     x: torch.Tensor,
     fmt: str,
     num_per_channels: int,
-    pos_to_token_topk: Optional[torch.Tensor] = None,
-    topk_weights: Optional[torch.Tensor] = None,
-    pos_to_expert: Optional[torch.Tensor] = None,
+    pos_to_token_topk: torch.Tensor | None = None,
+    topk_weights: torch.Tensor | None = None,
+    pos_to_expert: torch.Tensor | None = None,
     use_tma_aligned_col_major_sf: bool = False,
     round_sf: bool = False,
     use_packed_ue8m0: bool = False,
-    swiglu_clamp_value: Optional[float] = None,
-    clamped_count: Optional[torch.Tensor] = None,
-    sf_clamp_min: Optional[float] = None,
+    swiglu_clamp_value: float | None = None,
+    clamped_count: torch.Tensor | None = None,
+    sf_clamp_min: float | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     num_expanded_tokens = x.size(0)
     hidden = x.size(1) // 2
     out = torch.empty(
-        num_expanded_tokens, hidden,
-        dtype=torch.float8_e4m3fn, device=x.device,
+        num_expanded_tokens,
+        hidden,
+        dtype=torch.float8_e4m3fn,
+        device=x.device,
     )
     num_groups = _ceil_div(hidden, num_per_channels)
     if use_packed_ue8m0:
@@ -474,8 +535,10 @@ def _swiglu_fp8_quant_fake(
         )
     else:
         out_sf = torch.empty(
-            num_expanded_tokens, num_groups,
-            dtype=torch.float32, device=x.device,
+            num_expanded_tokens,
+            num_groups,
+            dtype=torch.float32,
+            device=x.device,
         )
     return out, out_sf
 
@@ -487,4 +550,202 @@ direct_register_custom_op(
     op_func=swiglu_forward_and_per_token_cast,
     mutates_args=[],
     fake_impl=_swiglu_fp8_quant_fake,
+)
+
+
+# ---------------------------------------------------------------------------
+# MLP-optimized SwiGLU + per-token FP8 quantization kernel
+# ---------------------------------------------------------------------------
+
+
+@tilelang.jit(
+    pass_configs={
+        tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
+    },
+)
+def _get_swiglu_mlp_kernel(
+    hidden: int,
+    use_clamp: bool,
+    in_dtype: T.dtype,
+    out_config: _CastOutputConfig,
+):
+    """MLP-optimized SwiGLU + per-token FP8 cast.
+
+    Key difference from the MoE variant: TILE_Y is fixed to num_per_channels
+    (128) so that TILE_X can grow to 8-16, giving many more blocks and far
+    better occupancy at small batch sizes.
+
+    MoE-specific parameters (pos_to_token_topk, topk_weights,
+    pos_to_expert, clamped_count) are removed to reduce register pressure.
+    """
+    num_threads = 256
+    _, num_per_channels = out_config.sf_block
+
+    # Fixed tiling: TILE_Y = quant block size, grow TILE_X for token parallelism
+    TILE_Y = num_per_channels  # 128
+    num_vec = _get_best_vectorize_size(in_dtype)
+    num_threads_per_token = TILE_Y // num_vec
+    TILE_X = num_threads // num_threads_per_token
+    # Ensure TILE_X * TILE_Y doesn't exceed reasonable shared-memory / register
+    # limits while keeping num_blocks high for occupancy.
+    while TILE_X * TILE_Y > 16384:
+        TILE_X //= 2
+    assert TILE_X >= 1
+
+    num_groups = TILE_Y // num_per_channels  # 1
+
+    num_tokens = T.dynamic("num_tokens")
+    sf_shape = _get_sf_shape((num_tokens, hidden), out_config)
+    sf_stride = T.dynamic("sf_stride")
+
+    num_blocks = T.ceildiv(num_tokens, TILE_X) * T.ceildiv(hidden, TILE_Y)
+
+    @T.prim_func
+    def swiglu_mlp_kernel(
+        x: T.Tensor[(num_tokens, hidden * 2), in_dtype],
+        out: T.Tensor[(num_tokens, hidden), out_config.dtype],
+        out_sf: T.StridedTensor[sf_shape, (sf_stride, 1), out_config.sf_dtype],
+        swiglu_clamp_value: T.float32,
+    ):
+        with T.Kernel(num_blocks, threads=num_threads) as pid:
+            pid_x = pid // T.ceildiv(hidden, TILE_Y)
+            pid_y = pid % T.ceildiv(hidden, TILE_Y)
+
+            x_fragment = T.alloc_fragment((TILE_X, TILE_Y), T.float32)
+            x_fragment_reshaped = T.reshape(
+                x_fragment, [TILE_X, num_groups, num_per_channels]
+            )
+            xl_fragment = T.alloc_fragment((TILE_X, TILE_Y), in_dtype)
+            xr_fragment = T.alloc_fragment((TILE_X, TILE_Y), in_dtype)
+            sf_inv_fragment = T.alloc_fragment((TILE_X, num_groups), T.float32)
+            out_fragment = T.alloc_fragment((TILE_X, TILE_Y), out_config.dtype)
+
+            # Load gate and up projections
+            for i, j in T.Parallel(TILE_X, TILE_Y):
+                tok = pid_x * TILE_X + i
+                ch = pid_y * TILE_Y + j
+                xl_fragment[i, j] = x[tok, ch]
+                xr_fragment[i, j] = x[tok, ch + hidden]
+
+            # SwiGLU: SiLU(gate) * up, with optional clamp
+            for i, j in T.Parallel(TILE_X, TILE_Y):
+                val_l = T.float32(xl_fragment[i, j])
+                val_r = T.float32(xr_fragment[i, j])
+                if use_clamp:
+                    val_l = T.min(val_l, swiglu_clamp_value)
+                    val_r = T.max(T.min(val_r, swiglu_clamp_value), -swiglu_clamp_value)
+                x_fragment[i, j] = val_l / (1 + T.exp(-val_l)) * val_r
+
+            # Per-token per-channel-group absmax → scale factor
+            T.reduce_absmax(x_fragment_reshaped, sf_inv_fragment, dim=2)
+            for i, j in T.Parallel(TILE_X, num_groups):
+                sf, sf_inv = _get_sf_and_inv(sf_inv_fragment[i, j], out_config)
+                _store_sf(
+                    out_sf, sf, pid_x * TILE_X + i, pid_y * num_groups + j, out_config
+                )
+                sf_inv_fragment[i, j] = sf_inv
+
+            # Quantize
+            for i, j in T.Parallel(TILE_X, TILE_Y):
+                out_fragment[i, j] = (
+                    x_fragment[i, j] * sf_inv_fragment[i, j // num_per_channels]
+                )
+            T.copy(out_fragment, out[pid_x * TILE_X, pid_y * TILE_Y])
+
+    return swiglu_mlp_kernel
+
+
+def swiglu_mlp_fp8_quant(
+    x: torch.Tensor,
+    fmt: str = "e4m3",
+    num_per_channels: int = 128,
+    use_tma_aligned_col_major_sf: bool = False,
+    round_sf: bool = False,
+    use_packed_ue8m0: bool = False,
+    swiglu_clamp_value: float | None = None,
+    sf_clamp_min: float | None = None,
+) -> QuantTensor:
+    """MLP-optimized SwiGLU + per-token FP8 quantization.
+
+    Designed for small-batch MLP paths (shared experts).  Uses token-parallel
+    tiling (multiple tokens per block) for high occupancy even at batch=1.
+
+    Args:
+        x: Input ``(num_tokens, hidden * 2)`` BF16 tensor (gate||up).
+        fmt: Target format (``'e4m3'``).
+        num_per_channels: Quantization group size (128).
+        swiglu_clamp_value: Optional clamp threshold.
+
+    Returns:
+        ``(out, out_sf)`` with FP8 output and scale factors.
+    """
+    assert x.dim() == 2 and x.is_contiguous()
+    assert x.dtype == torch.bfloat16
+    num_tokens, hidden = x.shape
+    hidden = hidden // 2
+
+    assert hidden % 128 == 0
+    assert num_per_channels == 128
+    assert fmt == "e4m3"
+
+    out_config = _get_cast_output_config(
+        fmt,
+        (1, num_per_channels),
+        use_tma_aligned_col_major_sf,
+        round_sf,
+        use_packed_ue8m0,
+        custom_clamp_min_value=sf_clamp_min,
+    )
+    kernel = _get_swiglu_mlp_kernel(
+        hidden,
+        swiglu_clamp_value is not None,
+        in_dtype=T.dtype(x.dtype),
+        out_config=out_config,
+    )
+
+    out = torch.empty((num_tokens, hidden), dtype=torch.float8_e4m3fn, device="cuda")
+    out_sf = _alloc_scaling_factors((num_tokens, hidden), out_config)
+    swiglu_clamp_value = 0 if swiglu_clamp_value is None else swiglu_clamp_value
+    if num_tokens > 0:
+        kernel(x, out, out_sf, swiglu_clamp_value)
+
+    out_sf = _cast_epilogue(out_sf, num_tokens, hidden, out_config)
+    return out, out_sf
+
+
+def _swiglu_mlp_fp8_quant_fake(
+    x: torch.Tensor,
+    fmt: str = "e4m3",
+    num_per_channels: int = 128,
+    use_tma_aligned_col_major_sf: bool = False,
+    round_sf: bool = False,
+    use_packed_ue8m0: bool = False,
+    swiglu_clamp_value: float | None = None,
+    sf_clamp_min: float | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    num_tokens = x.size(0)
+    hidden = x.size(1) // 2
+    out = torch.empty(num_tokens, hidden, dtype=torch.float8_e4m3fn, device=x.device)
+    num_groups = _ceil_div(hidden, num_per_channels)
+    if use_packed_ue8m0:
+        k_packed = _ceil_div(num_groups, 4)
+        tma_aligned_mn = _align(num_tokens, 4)
+        out_sf = torch.empty_strided(
+            (num_tokens, k_packed),
+            (1, tma_aligned_mn),
+            dtype=torch.int32,
+            device=x.device,
+        )
+    else:
+        out_sf = torch.empty(
+            num_tokens, num_groups, dtype=torch.float32, device=x.device
+        )
+    return out, out_sf
+
+
+direct_register_custom_op(
+    op_name="swiglu_mlp_fp8_quant",
+    op_func=swiglu_mlp_fp8_quant,
+    mutates_args=[],
+    fake_impl=_swiglu_mlp_fp8_quant_fake,
 )

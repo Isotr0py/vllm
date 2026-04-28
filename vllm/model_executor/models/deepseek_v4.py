@@ -117,12 +117,10 @@ class DeepseekV4MLP(nn.Module):
         self._use_fused_fp8 = False
 
     def _maybe_enable_fused_fp8(self) -> None:
-        """Check if the fused SwiGLU+FP8 path is available and cache result."""
         if self._use_fused_fp8:
             return
         if not has_tilelang():
             return
-        # Only works when down_proj has FP8 weights (deepseek_v4_fp8 quant).
         weight = getattr(self.down_proj, "weight", None)
         if weight is None or weight.dtype != torch.float8_e4m3fn:
             return
@@ -131,25 +129,21 @@ class DeepseekV4MLP(nn.Module):
         self._use_fused_fp8 = True
 
     def _forward_fused_fp8(self, x: torch.Tensor) -> torch.Tensor:
-        """SwiGLU + FP8 quant + FP8 GEMM, bypassing the standard linear path"""
-        # Trigger custom-op registration
         import vllm.model_executor.layers.fused_moe.ops.swiglu_fp8_quant_kernel  # noqa: F401
         from vllm.distributed import (
             get_tensor_model_parallel_world_size,
             tensor_model_parallel_all_reduce,
         )
+        from vllm.platforms import current_platform
 
         gate_up, _ = self.gate_up_proj(x)
 
-        # Fused SwiGLU + per-token per-128-channel FP8 quantization.
-        # On Blackwell, use packed UE8M0 TMA-aligned col-major scales to match
-        # what DeepGEMM expects (disable_ue8m0_cast=False path).
         use_ue8m0 = (
             is_deep_gemm_e8m0_used()
             and current_platform.is_device_capability_family(100)
         )
         clamp_val = float(self.swiglu_limit) if self.swiglu_limit is not None else None
-        x_fp8, x_sf = torch.ops.vllm.swiglu_fp8_quant(
+        x_fp8, x_sf = torch.ops.vllm.swiglu_mlp_fp8_quant(
             x=gate_up,
             fmt="e4m3",
             num_per_channels=128,
@@ -159,11 +153,9 @@ class DeepseekV4MLP(nn.Module):
             round_sf=use_ue8m0,
         )
 
-        # Get FP8 weight and block scales from down_proj
-        weight = self.down_proj.weight  # [hidden, inter//tp] FP8
-        weight_scale = self.down_proj.weight_scale_inv  # post-processed block scales
+        weight = self.down_proj.weight
+        weight_scale = self.down_proj.weight_scale_inv
 
-        # Direct FP8 GEMM
         num_tokens = x_fp8.shape[0]
         hidden_size = weight.shape[0]
         output = torch.empty(
@@ -180,7 +172,6 @@ class DeepseekV4MLP(nn.Module):
             use_ue8m0,
         )
 
-        # TP allreduce (same logic as RowParallelLinear)
         if self.reduce_results:
             tp_size = get_tensor_model_parallel_world_size()
             if tp_size > 1:
