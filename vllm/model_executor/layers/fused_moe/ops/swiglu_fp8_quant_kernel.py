@@ -179,7 +179,10 @@ def _cast_epilogue(
                 device=out_sf.device,
             )
         else:
-            out_sf = out_sf.view(dtype=torch.int32)
+            # Flatten -> view as int32 -> reshape back, since the last dim
+            # may not be divisible by 4 (e.g. num_groups=56 -> packed_k=14).
+            r0, r1 = out_sf.shape
+            out_sf = out_sf.flatten().view(torch.int32).view(r0, r1 // 4)
     out_sf = out_sf.T if config.use_tma_aligned_col_major_sf else out_sf
     out_sf = out_sf[: _ceil_div(num_tokens, config.sf_block[0]), :]
     return out_sf
