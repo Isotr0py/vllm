@@ -41,7 +41,11 @@ from vllm.utils.deep_gemm import (
     m_grouped_fp8_fp4_gemm_nt_contiguous,
     m_grouped_fp8_gemm_nt_contiguous,
 )
-from vllm.utils.import_utils import has_deep_gemm
+from vllm.utils.import_utils import has_deep_gemm, has_tilelang
+
+# Ensure TileLang custom ops are registered before use.
+if has_tilelang():
+    import vllm.model_executor.layers.fused_moe.ops.swiglu_fp8_quant_kernel  # noqa: F401
 
 logger = init_logger(__name__)
 
@@ -201,6 +205,19 @@ class DeepGemmExperts(mk.FusedMoEExpertsModular):
 
         M_sum, N = input.size()
         activation_out_dim = self.adjust_N_for_activation(N, activation)
+
+        # 0. TileLang fast path (requires tilelang package)
+        if has_tilelang() and activation == MoEActivation.SILU:
+            use_packed_ue8m0 = scale_fmt == DeepGemmQuantScaleFMT.UE8M0
+            use_round_sf = scale_fmt == DeepGemmQuantScaleFMT.FLOAT32_CEIL_UE8M0
+            return torch.ops.vllm.swiglu_fp8_quant(
+                x=input,
+                fmt="e4m3",
+                num_per_channels=block_k,
+                use_tma_aligned_col_major_sf=(not use_packed_ue8m0),
+                round_sf=use_round_sf,
+                use_packed_ue8m0=use_packed_ue8m0,
+            )
 
         # 1. DeepGemm UE8M0: fused SiLU+mul+clamp+quant+pack
         if scale_fmt == DeepGemmQuantScaleFMT.UE8M0:
@@ -421,6 +438,20 @@ class DeepGemmFP4Experts(mk.FusedMoEExpertsModular):
 
         M_sum, N = input.size()
         activation_out_dim = self.adjust_N_for_activation(N, activation)
+
+        # 0. TileLang fast path (requires tilelang package)
+        if has_tilelang() and activation == MoEActivation.SILU:
+            use_packed_ue8m0 = scale_fmt == DeepGemmQuantScaleFMT.UE8M0
+            use_round_sf = scale_fmt == DeepGemmQuantScaleFMT.FLOAT32_CEIL_UE8M0
+            return torch.ops.vllm.swiglu_fp8_quant(
+                x=input,
+                fmt="e4m3",
+                num_per_channels=block_k,
+                use_tma_aligned_col_major_sf=(not use_packed_ue8m0),
+                round_sf=use_round_sf,
+                use_packed_ue8m0=use_packed_ue8m0,
+                swiglu_clamp_value=self.gemm1_clamp_limit,
+            )
 
         if scale_fmt == DeepGemmQuantScaleFMT.UE8M0:
             assert activation == MoEActivation.SILU
