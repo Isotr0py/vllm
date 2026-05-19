@@ -686,8 +686,12 @@ class LLM(BeamSearchOfflineMixin, PoolingOfflineMixin):
 
         # Fast path: use Qwen3_5InputsProcessor for Qwen3.5 models
         if model_config.hf_config.model_type == "qwen3_5":
-            return self._preprocess_cmpl_qwen3_5(
-                prompts, tokenization_kwargs, mm_processor_kwargs
+            from vllm.model_executor.models.qwen3_5 import (
+                Qwen3_5InputsProcessor,
+            )
+
+            return Qwen3_5InputsProcessor(model_config).preprocess_cmpl(
+                prompts, tokenization_kwargs
             )
 
         renderer = self.renderer
@@ -722,20 +726,6 @@ class LLM(BeamSearchOfflineMixin, PoolingOfflineMixin):
             mm_processor_kwargs=mm_processor_kwargs,
         )
         return engine_input
-
-    def _preprocess_cmpl_qwen3_5(
-        self,
-        prompts: Sequence[PromptType],
-        tokenization_kwargs: dict[str, Any] | None = None,
-        mm_processor_kwargs: dict[str, Any] | None = None,
-    ) -> Sequence[EngineInput]:
-        """Use Qwen3_5InputsProcessor to bypass the renderer pipeline."""
-        from vllm.model_executor.models.qwen3_5 import Qwen3_5InputsProcessor
-
-        if not hasattr(self, "_qwen3_5_processor"):
-            self._qwen3_5_processor = Qwen3_5InputsProcessor(self.model_config)
-
-        return self._qwen3_5_processor.preprocess_cmpl(prompts, tokenization_kwargs)
 
     def _preprocess_chat(
         self,
