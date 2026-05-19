@@ -27,6 +27,7 @@
 import typing
 from collections.abc import Callable, Iterable
 
+import numpy as np
 import torch
 from torch import nn
 
@@ -541,6 +542,345 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLMBase, QwenNextMixtureOfExperts):
 ########################################################
 # Qwen3_5-Dense
 ########################################################
+
+from collections.abc import Sequence
+from typing import Any
+
+from vllm.inputs.engine import mm_input
+from vllm.multimodal.inputs import PlaceholderRange
+from vllm.renderers.inputs.preprocess import parse_model_prompt
+
+
+class Qwen3_5InputsProcessor:
+    """Flat multimodal inputs processor for Qwen3.5-VL.
+
+    Zero inheritance, zero abstract deps.
+    Directly calls HF ``Qwen3VLProcessor`` and builds ``MultiModalInput``.
+
+    Usage::
+
+        proc = Qwen3_5InputsProcessor(model_config)
+        result: MultiModalInput = proc(prompt_token_ids, mm_data)
+    """
+
+    def __init__(self, model_config):
+        from vllm.tokenizers.registry import cached_tokenizer_from_config
+        from vllm.transformers_utils.processor import cached_processor_from_config
+
+        self.model_config = model_config
+        self.tokenizer = cached_tokenizer_from_config(model_config)
+        self.hf_processor = cached_processor_from_config(model_config)
+
+        hf_config = model_config.hf_config
+        vision_cfg = hf_config.vision_config
+        self._spatial_merge_size = vision_cfg.spatial_merge_size
+        self._vision_start_id = hf_config.vision_start_token_id
+        self._vision_end_id = hf_config.vision_end_token_id
+        self._video_token_id = hf_config.video_token_id
+        self._image_token_id = self.hf_processor.image_token_id
+        self._temporal_patch_size = (
+            self.hf_processor.video_processor.temporal_patch_size
+        )
+
+    def apply(
+        self,
+        prompt_token_ids: list[int],
+        mm_data: dict[str, object],
+    ) -> dict:
+        """Process multimodal data and return ``MultiModalInput``.
+
+        Args:
+            prompt_token_ids: Token IDs with ``<|image_pad|>`` /
+                ``<|vision_start|><|video_pad|><|vision_end|>`` placeholders.
+            mm_data: Raw multimodal data, e.g.
+                ``{"image": [PIL.Image, ...], "video": [(array, meta), ...]}``.
+        """
+        images = mm_data.get("image") or []
+        if not isinstance(images, list):
+            images = [images]
+        videos = mm_data.get("video") or []
+        if not isinstance(videos, list):
+            videos = [videos]
+
+        # --- Process images ---
+        image_results: list[dict] = []
+        if images:
+            img_out = self.hf_processor(
+                text="",
+                images=list(images),
+                return_tensors="pt",
+            )
+            grid_thw_all = img_out["image_grid_thw"]
+            for i in range(len(images)):
+                grid_thw = grid_thw_all[i]  # shape (3,)
+                num_tokens = int(grid_thw.prod()) // (self._spatial_merge_size**2)
+                image_results.append(
+                    {
+                        "pixel_values": img_out["pixel_values"],
+                        "image_grid_thw": grid_thw,
+                        "num_tokens": num_tokens,
+                        "repl_tokens": [self._image_token_id] * num_tokens,
+                    }
+                )
+
+        # --- Process videos ---
+        video_results: list[dict] = []
+        for video_item in videos:
+            video_array, metadata = video_item
+            vid_out = self.hf_processor(
+                text="<|vision_start|><|video_pad|><|vision_end|>",
+                videos=[[video_array]],
+                video_metadata=[[metadata]],
+                return_tensors="pt",
+            )
+
+            grid_thw = vid_out["video_grid_thw"]
+            num_frames = int(grid_thw[0, 0])
+            tokens_per_frame_base = int(grid_thw[0, 1:].prod()) // (
+                self._spatial_merge_size**2
+            )
+            tokens_per_frame = [tokens_per_frame_base] * num_frames
+
+            timestamps = self._compute_timestamps(metadata)
+
+            repl_tokens = self._build_video_tokens(tokens_per_frame, timestamps)
+
+            video_results.append(
+                {
+                    "pixel_values_videos": vid_out["pixel_values_videos"],
+                    "video_grid_thw": grid_thw,
+                    "timestamps": timestamps,
+                    "repl_tokens": repl_tokens,
+                }
+            )
+
+        # --- Apply prompt updates ---
+        new_ids, mm_kwargs, placeholders = self._apply_prompt_updates(
+            list(prompt_token_ids), image_results, video_results
+        )
+
+        # --- Build MultiModalInput ---
+        mm_hashes: dict[str, list[str]] = {}
+        if image_results:
+            mm_hashes["image"] = [f"img-{i}" for i in range(len(image_results))]
+        if video_results:
+            mm_hashes["video"] = [f"vid-{i}" for i in range(len(video_results))]
+
+        return mm_input(new_ids, mm_kwargs, mm_hashes, placeholders)
+
+    def preprocess_cmpl(
+        self,
+        prompts: Sequence[Any],
+        tokenization_kwargs: dict[str, Any] | None = None,
+    ) -> list[dict]:
+        """Full preprocessing: raw prompt → EngineInput list.
+
+        Takes the same prompt format as ``LLM.generate()`` (str, TokensPrompt,
+        etc.) and returns a list of ``EngineInput`` ready for ``AsyncLLM``.
+        """
+        model_config = self.model_config
+        results: list[dict] = []
+        tok_kwargs = tokenization_kwargs or {}
+
+        for prompt in prompts:
+            parsed = parse_model_prompt(model_config, prompt)
+
+            # Tokenize
+            prompt_text = parsed.get("prompt", parsed.get("prompt_token_ids"))
+            if isinstance(prompt_text, str):
+                prompt_token_ids = self.tokenizer.encode(prompt_text, **tok_kwargs)
+            else:
+                prompt_token_ids = prompt_text
+
+            mm_data = parsed.get("multi_modal_data")
+
+            if mm_data:
+                engine_input = self.apply(prompt_token_ids, mm_data)
+            else:
+                engine_input = {"type": "token", "prompt_token_ids": prompt_token_ids}
+
+            if cache_salt := parsed.get("cache_salt"):
+                engine_input["cache_salt"] = cache_salt
+
+            results.append(engine_input)
+
+        return results
+
+    # ------------------------------------------------------------------
+    # Prompt update: scan & replace placeholder tokens
+    # ------------------------------------------------------------------
+
+    def _apply_prompt_updates(
+        self,
+        ids: list[int],
+        image_results: list[dict],
+        video_results: list[dict],
+    ) -> tuple[list[int], dict, dict]:
+        placeholders: dict[str, list] = {"image": [], "video": []}
+        mm_kwargs: dict[str, list] = {"image": [], "video": []}
+
+        # Images: replace contiguous <|image_pad|> blocks
+        img_idx = 0
+        i = 0
+        while i < len(ids):
+            if ids[i] == self._image_token_id and img_idx < len(image_results):
+                start = i
+                while i < len(ids) and ids[i] == self._image_token_id:
+                    i += 1
+                result = image_results[img_idx]
+                repl = result["repl_tokens"]
+                ids[start:i] = repl
+                placeholders["image"].append(
+                    PlaceholderRange(offset=start, length=len(repl))
+                )
+                mm_kwargs["image"].append(self._build_image_kwarg(result, img_idx))
+                img_idx += 1
+            else:
+                i += 1
+
+        # Videos: replace <|vision_start|><|video_pad|><|vision_end|>
+        video_target = [
+            self._vision_start_id,
+            self._video_token_id,
+            self._vision_end_id,
+        ]
+        vid_idx = 0
+        i = 0
+        while i < len(ids):
+            if ids[i : i + 3] == video_target and vid_idx < len(video_results):
+                result = video_results[vid_idx]
+                repl = result["repl_tokens"]
+                ids[i : i + 3] = repl
+                placeholders["video"].append(
+                    PlaceholderRange(offset=i, length=len(repl))
+                )
+                mm_kwargs["video"].append(self._build_video_kwarg(result))
+                vid_idx += 1
+                i += len(repl)
+            else:
+                i += 1
+
+        if not mm_kwargs["image"]:
+            del mm_kwargs["image"]
+            del placeholders["image"]
+        if not mm_kwargs["video"]:
+            del mm_kwargs["video"]
+            del placeholders["video"]
+
+        return ids, mm_kwargs, placeholders
+
+    # ------------------------------------------------------------------
+    # Build mm_kwargs items
+    # ------------------------------------------------------------------
+
+    def _build_image_kwarg(self, result: dict, idx: int) -> dict:
+        """Build a single image kwarg dict (modality-level tensors)."""
+        from vllm.multimodal.inputs import (
+            MultiModalBatchedField,
+            MultiModalFieldElem,
+            MultiModalKwargsItem,
+            MultiModalSharedField,
+        )
+
+        grid_thw = result["image_grid_thw"]
+        pixel_grid_size = int(grid_thw.prod())
+
+        return MultiModalKwargsItem(
+            {
+                "pixel_values": MultiModalFieldElem(
+                    data=result["pixel_values"],
+                    field=MultiModalSharedField(batch_size=pixel_grid_size),
+                ),
+                "image_grid_thw": MultiModalFieldElem(
+                    data=grid_thw,  # shape (3,) → reduce_data stacks to (M, 3)
+                    field=MultiModalBatchedField(keep_on_cpu=True),
+                ),
+            }
+        )
+
+    def _build_video_kwarg(self, result: dict) -> dict:
+        """Build a single video kwarg dict."""
+        import torch
+
+        from vllm.multimodal.inputs import (
+            MultiModalBatchedField,
+            MultiModalFieldElem,
+            MultiModalKwargsItem,
+            MultiModalSharedField,
+        )
+
+        grid_thw = result["video_grid_thw"]
+        video_grid_size = int(grid_thw.prod())
+        timestamps = result["timestamps"]
+        if not isinstance(timestamps, torch.Tensor):
+            timestamps = torch.tensor(timestamps, dtype=torch.float32)
+
+        return MultiModalKwargsItem(
+            {
+                "pixel_values_videos": MultiModalFieldElem(
+                    data=result["pixel_values_videos"],
+                    field=MultiModalSharedField(batch_size=video_grid_size),
+                ),
+                "video_grid_thw": MultiModalFieldElem(
+                    data=grid_thw,  # shape (1, 3) → reduce_data stacks to (M, 3)
+                    field=MultiModalBatchedField(keep_on_cpu=True),
+                ),
+                "timestamps": MultiModalFieldElem(
+                    data=timestamps,  # shape (num_frames,) → reduce_data stacks
+                    field=MultiModalBatchedField(keep_on_cpu=True),
+                ),
+            }
+        )
+
+    # ------------------------------------------------------------------
+    # Video helpers (inlined from Qwen3VLMultiModalProcessor)
+    # ------------------------------------------------------------------
+
+    def _compute_timestamps(self, metadata: dict) -> list[float]:
+        """Compute per-frame timestamps in seconds."""
+        merge_size = self._spatial_merge_size
+        indices = metadata["frames_indices"]
+        video_fps = metadata["fps"]
+
+        do_sample = metadata.get("do_sample_frames", False)
+        if do_sample:
+            total = metadata["total_num_frames"]
+            vp = self.hf_processor.video_processor
+            num_frames = int(total / metadata["fps"] * vp.fps)
+            num_frames = min(min(max(num_frames, vp.min_frames), vp.max_frames), total)
+            indices = np.linspace(0, total - 1, num_frames).round().astype(int).tolist()
+
+        if not isinstance(indices, list):
+            indices = indices.tolist()
+        if len(indices) % merge_size != 0:
+            indices = indices + [indices[-1]] * (merge_size - len(indices) % merge_size)
+        raw_ts = [idx / video_fps for idx in indices]
+        return [
+            (raw_ts[i] + raw_ts[i + merge_size - 1]) / 2
+            for i in range(0, len(raw_ts), merge_size)
+        ]
+
+    def _build_video_tokens(
+        self,
+        tokens_per_frame: list[int],
+        timestamps: list[float],
+    ) -> list[int]:
+        """Build per-frame token sequence for a video.
+
+        Structure per frame::
+
+            [timestamp_tokens] + [vision_start] + [video_token] * N + [vision_end]
+        """
+        assert len(timestamps) == len(tokens_per_frame)
+        all_ids: list[int] = []
+        for ts, n_tok in zip(timestamps, tokens_per_frame):
+            ts_text = f"<{ts:.1f} seconds>"
+            ts_ids = self.tokenizer.encode(ts_text, add_special_tokens=False)
+            all_ids.extend(ts_ids)
+            all_ids.append(self._vision_start_id)
+            all_ids.extend([self._video_token_id] * n_tok)
+            all_ids.append(self._vision_end_id)
+        return all_ids
 
 
 @MULTIMODAL_REGISTRY.register_processor(
