@@ -551,6 +551,35 @@ from vllm.multimodal.inputs import PlaceholderRange
 from vllm.renderers.inputs.preprocess import parse_model_prompt
 
 
+class _ProcessorCache:
+    """Simple LRU cache for HF processor outputs. Zero abstract deps."""
+
+    def __init__(self, max_bytes: int):
+        from collections import OrderedDict
+
+        self._data: OrderedDict[str, tuple[dict, int]] = OrderedDict()
+        self._max_bytes = max_bytes
+        self._used = 0
+
+    def get(self, key: str) -> dict | None:
+        entry = self._data.get(key)
+        if entry is not None:
+            self._data.move_to_end(key)
+            return entry[0]
+        return None
+
+    def put(self, key: str, value: dict, size: int) -> None:
+        if key in self._data:
+            _, old_size = self._data[key]
+            self._used -= old_size
+        else:
+            while self._used + size > self._max_bytes and self._data:
+                _, evicted = self._data.popitem(last=False)
+                self._used -= evicted
+        self._data[key] = (value, size)
+        self._used += size
+
+
 class Qwen3_5InputsProcessor:
     """Flat multimodal inputs processor for Qwen3.5-VL.
 
@@ -563,13 +592,18 @@ class Qwen3_5InputsProcessor:
         result: MultiModalInput = proc(prompt_token_ids, mm_data)
     """
 
+    _cache: _ProcessorCache | None = None
+
     def __init__(self, model_config):
+        import hashlib
+
         from vllm.tokenizers.registry import cached_tokenizer_from_config
         from vllm.transformers_utils.processor import cached_processor_from_config
 
         self.model_config = model_config
         self.tokenizer = cached_tokenizer_from_config(model_config)
         self.hf_processor = cached_processor_from_config(model_config)
+        self._hasher = hashlib.sha256(model_config.model.encode())
 
         hf_config = model_config.hf_config
         vision_cfg = hf_config.vision_config
@@ -581,6 +615,12 @@ class Qwen3_5InputsProcessor:
         self._temporal_patch_size = (
             self.hf_processor.video_processor.temporal_patch_size
         )
+
+        # Initialize class-level cache once
+        mm_config = model_config.multimodal_config
+        cache_gb = mm_config.mm_processor_cache_gb if mm_config else 0
+        if cache_gb > 0 and Qwen3_5InputsProcessor._cache is None:
+            Qwen3_5InputsProcessor._cache = _ProcessorCache(int(cache_gb * (1 << 30)))
 
     def apply(
         self,
@@ -602,31 +642,46 @@ class Qwen3_5InputsProcessor:
         if not isinstance(videos, list):
             videos = [videos]
 
-        # --- Process images ---
+        # --- Process images (per-item for caching) ---
         image_results: list[dict] = []
-        if images:
+        image_hashes: list[str] = []
+        for img in images:
+            mm_hash = self._hash_mm_item(img)
+            image_hashes.append(mm_hash)
+            cached = self._cache.get(mm_hash) if self._cache is not None else None
+            if cached is not None:
+                image_results.append(cached)
+                continue
+
             img_out = self.hf_processor(
                 text="",
-                images=list(images),
+                images=[img],
                 return_tensors="pt",
             )
-            grid_thw_all = img_out["image_grid_thw"]
-            for i in range(len(images)):
-                grid_thw = grid_thw_all[i]  # shape (3,)
-                num_tokens = int(grid_thw.prod()) // (self._spatial_merge_size**2)
-                image_results.append(
-                    {
-                        "pixel_values": img_out["pixel_values"],
-                        "image_grid_thw": grid_thw,
-                        "num_tokens": num_tokens,
-                        "repl_tokens": [self._image_token_id] * num_tokens,
-                    }
-                )
+            grid_thw = img_out["image_grid_thw"][0]  # shape (3,)
+            num_tokens = int(grid_thw.prod()) // (self._spatial_merge_size**2)
+            result = {
+                "pixel_values": img_out["pixel_values"],
+                "image_grid_thw": grid_thw,
+                "num_tokens": num_tokens,
+                "repl_tokens": [self._image_token_id] * num_tokens,
+            }
+            image_results.append(result)
+            if self._cache is not None:
+                size = img_out["pixel_values"].nbytes + grid_thw.nbytes
+                self._cache.put(mm_hash, result, size)
 
-        # --- Process videos ---
+        # --- Process videos (per-item for caching) ---
         video_results: list[dict] = []
-        for video_item in videos:
-            video_array, metadata = video_item
+        video_hashes: list[str] = []
+        for video_array, metadata in videos:
+            mm_hash = self._hash_mm_item(video_array)
+            video_hashes.append(mm_hash)
+            cached = self._cache.get(mm_hash) if self._cache is not None else None
+            if cached is not None:
+                video_results.append(cached)
+                continue
+
             vid_out = self.hf_processor(
                 text="<|vision_start|><|video_pad|><|vision_end|>",
                 videos=[[video_array]],
@@ -642,17 +697,18 @@ class Qwen3_5InputsProcessor:
             tokens_per_frame = [tokens_per_frame_base] * num_frames
 
             timestamps = self._compute_timestamps(metadata)
-
             repl_tokens = self._build_video_tokens(tokens_per_frame, timestamps)
 
-            video_results.append(
-                {
-                    "pixel_values_videos": vid_out["pixel_values_videos"],
-                    "video_grid_thw": grid_thw,
-                    "timestamps": timestamps,
-                    "repl_tokens": repl_tokens,
-                }
-            )
+            result = {
+                "pixel_values_videos": vid_out["pixel_values_videos"],
+                "video_grid_thw": grid_thw,
+                "timestamps": timestamps,
+                "repl_tokens": repl_tokens,
+            }
+            video_results.append(result)
+            if self._cache is not None:
+                size = vid_out["pixel_values_videos"].nbytes + grid_thw.nbytes
+                self._cache.put(mm_hash, result, size)
 
         # --- Apply prompt updates ---
         new_ids, mm_kwargs, placeholders = self._apply_prompt_updates(
@@ -661,10 +717,10 @@ class Qwen3_5InputsProcessor:
 
         # --- Build MultiModalInput ---
         mm_hashes: dict[str, list[str]] = {}
-        if image_results:
-            mm_hashes["image"] = [f"img-{i}" for i in range(len(image_results))]
-        if video_results:
-            mm_hashes["video"] = [f"vid-{i}" for i in range(len(video_results))]
+        if image_hashes:
+            mm_hashes["image"] = image_hashes
+        if video_hashes:
+            mm_hashes["video"] = video_hashes
 
         return mm_input(new_ids, mm_kwargs, mm_hashes, placeholders)
 
@@ -768,6 +824,20 @@ class Qwen3_5InputsProcessor:
             del placeholders["video"]
 
         return ids, mm_kwargs, placeholders
+
+    # ------------------------------------------------------------------
+    # Hashing
+    # ------------------------------------------------------------------
+
+    def _hash_mm_item(self, data) -> str:
+        h = self._hasher.copy()
+        if hasattr(data, "tobytes"):
+            h.update(data.tobytes())
+        elif isinstance(data, bytes):
+            h.update(data)
+        else:
+            h.update(str(data).encode())
+        return h.hexdigest()[:16]
 
     # ------------------------------------------------------------------
     # Build mm_kwargs items
