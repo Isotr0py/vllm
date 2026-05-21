@@ -552,32 +552,40 @@ from vllm.renderers.inputs.preprocess import parse_model_prompt
 
 
 class _ProcessorCache:
-    """Simple LRU cache for HF processor outputs. Zero abstract deps."""
+    """Key-only LRU cache (sender side).
+
+    Mirrors the P1 receiver cache keys so P0 can detect hits without
+    holding tensor data.  Stores only prompt-level metadata needed to
+    drive prompt updates; the heavy tensors live exclusively in P1's
+    receiver cache.
+    """
 
     def __init__(self, max_bytes: int):
         from collections import OrderedDict
 
+        # value = (prompt_meta, estimated_byte_cost)
         self._data: OrderedDict[str, tuple[dict, int]] = OrderedDict()
         self._max_bytes = max_bytes
         self._used = 0
 
     def get(self, key: str) -> dict | None:
+        """Return cached prompt metadata or None on miss."""
         entry = self._data.get(key)
         if entry is not None:
             self._data.move_to_end(key)
             return entry[0]
         return None
 
-    def put(self, key: str, value: dict, size: int) -> None:
+    def put(self, key: str, meta: dict, cost: int) -> None:
         if key in self._data:
-            _, old_size = self._data[key]
-            self._used -= old_size
+            _, old_cost = self._data[key]
+            self._used -= old_cost
         else:
-            while self._used + size > self._max_bytes and self._data:
+            while self._used + cost > self._max_bytes and self._data:
                 _, evicted = self._data.popitem(last=False)
                 self._used -= evicted
-        self._data[key] = (value, size)
-        self._used += size
+        self._data[key] = (meta, cost)
+        self._used += cost
 
 
 class Qwen3_5InputsProcessor:
@@ -648,11 +656,14 @@ class Qwen3_5InputsProcessor:
         for img in images:
             mm_hash = self._hash_mm_item(img)
             image_hashes.append(mm_hash)
-            cached = self._cache.get(mm_hash) if self._cache is not None else None
-            if cached is not None:
-                image_results.append(cached)
+
+            # Key-only hit: skip HF processing, let P1 receiver cache fill data
+            meta = self._cache.get(mm_hash) if self._cache is not None else None
+            if meta is not None:
+                image_results.append({**meta, "cached": True})
                 continue
 
+            # Miss: process through HF
             img_out = self.hf_processor(
                 text="",
                 images=[img],
@@ -665,11 +676,17 @@ class Qwen3_5InputsProcessor:
                 "image_grid_thw": grid_thw,
                 "num_tokens": num_tokens,
                 "repl_tokens": [self._image_token_id] * num_tokens,
+                "cached": False,
             }
             image_results.append(result)
+            # Store key-only metadata in sender cache
             if self._cache is not None:
-                size = img_out["pixel_values"].nbytes + grid_thw.nbytes
-                self._cache.put(mm_hash, result, size)
+                repl = [self._image_token_id] * num_tokens
+                self._cache.put(
+                    mm_hash,
+                    {"num_tokens": num_tokens, "repl_tokens": repl},
+                    cost=64 + num_tokens * 4,
+                )
 
         # --- Process videos (per-item for caching) ---
         video_results: list[dict] = []
@@ -677,9 +694,10 @@ class Qwen3_5InputsProcessor:
         for video_array, metadata in videos:
             mm_hash = self._hash_mm_item(video_array)
             video_hashes.append(mm_hash)
-            cached = self._cache.get(mm_hash) if self._cache is not None else None
-            if cached is not None:
-                video_results.append(cached)
+
+            meta = self._cache.get(mm_hash) if self._cache is not None else None
+            if meta is not None:
+                video_results.append({**meta, "cached": True})
                 continue
 
             vid_out = self.hf_processor(
@@ -704,11 +722,15 @@ class Qwen3_5InputsProcessor:
                 "video_grid_thw": grid_thw,
                 "timestamps": timestamps,
                 "repl_tokens": repl_tokens,
+                "cached": False,
             }
             video_results.append(result)
             if self._cache is not None:
-                size = vid_out["pixel_values_videos"].nbytes + grid_thw.nbytes
-                self._cache.put(mm_hash, result, size)
+                self._cache.put(
+                    mm_hash,
+                    {"num_tokens": sum(tokens_per_frame), "repl_tokens": repl_tokens},
+                    cost=64 + len(repl_tokens) * 4,
+                )
 
         # --- Apply prompt updates ---
         new_ids, mm_kwargs, placeholders = self._apply_prompt_updates(
@@ -843,8 +865,11 @@ class Qwen3_5InputsProcessor:
     # Build mm_kwargs items
     # ------------------------------------------------------------------
 
-    def _build_image_kwarg(self, result: dict, idx: int) -> dict:
-        """Build a single image kwarg dict (modality-level tensors)."""
+    def _build_image_kwarg(self, result: dict, idx: int):
+        """Build a single image kwarg.  Returns None for cache hits."""
+        if result.get("cached"):
+            return None
+
         from vllm.multimodal.inputs import (
             MultiModalBatchedField,
             MultiModalFieldElem,
@@ -868,8 +893,11 @@ class Qwen3_5InputsProcessor:
             }
         )
 
-    def _build_video_kwarg(self, result: dict) -> dict:
-        """Build a single video kwarg dict."""
+    def _build_video_kwarg(self, result: dict):
+        """Build a single video kwarg.  Returns None for cache hits."""
+        if result.get("cached"):
+            return None
+
         import torch
 
         from vllm.multimodal.inputs import (
