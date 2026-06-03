@@ -1332,12 +1332,12 @@ class FusedMoE(PluggableLayer):
     @classmethod
     def make_expert_params_mapping(
         cls,
-        model: torch.nn.Module,
         ckpt_gate_proj_name: str,
         ckpt_down_proj_name: str,
         ckpt_up_proj_name: str,
         num_experts: int,
         num_redundant_experts: int = 0,
+        base_layer: str = "",
     ) -> list[tuple[str, str, int, str]]:
         num_physical_experts = num_experts + num_redundant_experts
 
@@ -1349,12 +1349,6 @@ class FusedMoE(PluggableLayer):
             EplbState.build_initial_global_physical_to_logical_map(
                 num_experts, num_redundant_experts
             )
-        )
-
-        base_layer = (
-            "base_layer."
-            if any(".base_layer." in name for name, _ in model.named_parameters())
-            else ""
         )
 
         return [
@@ -1398,20 +1392,20 @@ class FusedMoE(PluggableLayer):
 
 # This is a temporary forwarding method which will be removed/modified layer.
 def fused_moe_make_expert_params_mapping(
-    model: torch.nn.Module,
     ckpt_gate_proj_name: str,
     ckpt_down_proj_name: str,
     ckpt_up_proj_name: str,
     num_experts: int,
     num_redundant_experts: int = 0,
+    base_layer: str = "",
 ) -> list[tuple[str, str, int, str]]:
     return FusedMoE.make_expert_params_mapping(
-        model,
         ckpt_gate_proj_name,
         ckpt_down_proj_name,
         ckpt_up_proj_name,
         num_experts,
         num_redundant_experts,
+        base_layer,
     )
 
 

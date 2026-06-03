@@ -361,7 +361,12 @@ def process_packed_modules_mapping(
     model: nn.Module, force_2d_moe: bool = False
 ) -> dict[str, list[str]]:
     if is_moe_model(model):
-        if moe_packed_mapping := get_moe_expert_mapping(model):
+        base_layer = (
+            "base_layer."
+            if any(".base_layer." in name for name, _ in model.named_parameters())
+            else ""
+        )
+        if moe_packed_mapping := get_moe_expert_mapping(model, base_layer=base_layer):
             # This method generates and returns a dictionary mapping packed module
             # names to lists of their corresponding submodule names. It includes
             # both static mappings and dynamic mappings for expert layers, where

@@ -123,15 +123,16 @@ def get_packed_modules_mapping(model: torch.nn.Module) -> dict[str, list[str]]:
 
 def get_moe_expert_mapping(
     model: torch.nn.Module,
+    **kwargs: Any,
 ) -> list[tuple[str, str, int, str]]:
     if parent_map := getattr(model, "get_expert_mapping", None):
-        return parent_map()
+        return parent_map(**kwargs)
     else:
         # We only check main components instead of whole model submodules
         for child in model.children():
             child_map = getattr(child, "get_expert_mapping", None)
             if child_map is not None:
-                return child_map()
+                return child_map(**kwargs)
         return []
 
 
