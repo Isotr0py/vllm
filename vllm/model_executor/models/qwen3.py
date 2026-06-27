@@ -57,7 +57,13 @@ from .interfaces import (
 )
 from .qwen2 import Qwen2MLP as Qwen3MLP
 from .qwen2 import Qwen2Model
-from .utils import AutoWeightsLoader, PPMissingLayer, extract_layer_index, maybe_prefix
+from .utils import (
+    AutoWeightsLoader,
+    PPMissingLayer,
+    WeightsMapper,
+    extract_layer_index,
+    maybe_prefix,
+)
 
 logger = init_logger(__name__)
 
@@ -267,6 +273,16 @@ class Qwen3Model(Qwen2Model):
 class Qwen3ForCausalLM(
     LocalArgmaxMixin, nn.Module, SupportsLoRA, SupportsPP, SupportsEagle, SupportsEagle3
 ):
+    hf_to_vllm_mapper = WeightsMapper(
+        orig_to_new_stacked={
+            ".q_proj": (".qkv_proj", "q"),
+            ".k_proj": (".qkv_proj", "k"),
+            ".v_proj": (".qkv_proj", "v"),
+            ".gate_proj": (".gate_up_proj", 0),
+            ".up_proj": (".gate_up_proj", 1),
+        }
+    )
+
     packed_modules_mapping = {
         "qkv_proj": [
             "q_proj",
@@ -343,4 +359,4 @@ class Qwen3ForCausalLM(
             self,
             skip_prefixes=(["lm_head."] if self.config.tie_word_embeddings else None),
         )
-        return loader.load_weights(weights)
+        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
