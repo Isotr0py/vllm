@@ -164,7 +164,9 @@ class KimiK25ProcessingInfo(BaseProcessingInfo):
         # None means unlimited
         return {"vision_chunk": None}
 
+    @classmethod
     def get_max_image_size(
+        cls,
         patch_size: int,
         merge_kernel_size: int,
         in_patch_limit: int,
@@ -209,7 +211,13 @@ class KimiK25DummyInputsBuilder(BaseDummyInputsBuilder[KimiK25ProcessingInfo]):
 
     def get_dummy_mm_items(self):
         media_proc_cfg = self.info.image_processor.media_proc_cfg
-        max_size = self.info.get_max_image_size(media_proc_cfg)
+        max_size = self.info.get_max_image_size(
+            media_proc_cfg["patch_size"],
+            media_proc_cfg["merge_kernel_size"],
+            media_proc_cfg["in_patch_limit"],
+            media_proc_cfg["patch_limit_on_one_side"],
+            media_proc_cfg["fixed_output_tokens"],
+        )
         dummy_videos = self._get_dummy_images(
             height=max_size.height,
             width=max_size.width,
