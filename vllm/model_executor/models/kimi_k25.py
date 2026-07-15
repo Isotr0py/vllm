@@ -7,7 +7,6 @@ Kimi-K2.5 extends Kimi-K2 with vision support.
 """
 
 from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import dataclass
 from typing import Annotated, Any, Literal
 
 import torch
@@ -42,7 +41,11 @@ from vllm.multimodal.inputs import (
     VisionChunkImage,
     VisionChunkVideo,
 )
-from vllm.multimodal.parse import MultiModalDataItems, VisionChunkProcessorItems
+from vllm.multimodal.parse import (
+    ImageSize,
+    MultiModalDataItems,
+    VisionChunkProcessorItems,
+)
 from vllm.multimodal.processing import (
     BaseDummyInputsBuilder,
     BaseMultiModalProcessor,
@@ -58,6 +61,7 @@ from vllm.transformers_utils.processor import cached_get_image_processor
 from vllm.transformers_utils.processors.kimi_k25 import KimiK25Processor
 from vllm.transformers_utils.processors.kimi_k25_vision_fused import (
     KimiK25FusedVisionProcessor,
+    navit_resize_image,
 )
 from vllm.utils.import_utils import is_numba_available
 from vllm.utils.tensor_schema import TensorSchema, TensorShape
@@ -70,13 +74,6 @@ from .utils import (
 )
 
 logger = init_logger(__name__)
-
-
-# Dummy input dimensions for profiling.
-@dataclass
-class MaxImageTokenMeta:
-    width: int = 3000
-    height: int = 3000
 
 
 class KimiK25MediaPixelInputs(TensorSchema):
@@ -167,6 +164,41 @@ class KimiK25ProcessingInfo(BaseProcessingInfo):
         # None means unlimited
         return {"vision_chunk": None}
 
+    def get_max_image_size(
+        patch_size: int,
+        merge_kernel_size: int,
+        in_patch_limit: int,
+        patch_limit_on_one_side: int,
+        fixed_output_tokens: int | None,
+    ) -> tuple[int, int]:
+        max_side = patch_limit_on_one_side * patch_size
+        best_score = (-1, -1)
+        best_size = (max_side, max_side)
+
+        for width_patches in range(patch_limit_on_one_side + 1):
+            width = min((width_patches + 1) * patch_size - 1, max_side)
+            for height_patches in range(width_patches, patch_limit_on_one_side + 1):
+                height = min((height_patches + 1) * patch_size - 1, max_side)
+                resize_config = navit_resize_image(
+                    width,
+                    height,
+                    patch_size,
+                    merge_kernel_size,
+                    in_patch_limit,
+                    patch_limit_on_one_side,
+                    fixed_output_tokens,
+                )
+                padded_width = resize_config["new_width"] + resize_config["pad_width"]
+                padded_height = (
+                    resize_config["new_height"] + resize_config["pad_height"]
+                )
+                num_patches = padded_width // patch_size * (padded_height // patch_size)
+                score = (resize_config["num_tokens"], num_patches)
+                if score > best_score:
+                    best_score = score
+                    best_size = (width, height)
+        return ImageSize(width=best_size[0], height=best_size[1])
+
 
 class KimiK25DummyInputsBuilder(BaseDummyInputsBuilder[KimiK25ProcessingInfo]):
     """Builds dummy inputs for Kimi-K2.5 model profiling."""
@@ -176,9 +208,11 @@ class KimiK25DummyInputsBuilder(BaseDummyInputsBuilder[KimiK25ProcessingInfo]):
         return self.info.media_token * num_media
 
     def get_dummy_mm_items(self):
+        media_proc_cfg = self.info.image_processor.media_proc_cfg
+        max_size = self.info.get_max_image_size(media_proc_cfg)
         dummy_videos = self._get_dummy_images(
-            height=MaxImageTokenMeta.height,
-            width=MaxImageTokenMeta.width,
+            height=max_size.height,
+            width=max_size.width,
             num_images=self.info.image_processor.num_frames_per_chunk,
         )
 
@@ -192,8 +226,8 @@ class KimiK25DummyInputsBuilder(BaseDummyInputsBuilder[KimiK25ProcessingInfo]):
         image_dummy_item = VisionChunkImage(
             type="image",
             image=self._get_dummy_images(
-                height=MaxImageTokenMeta.height,
-                width=MaxImageTokenMeta.width,
+                height=max_size.height,
+                width=max_size.width,
                 num_images=1,
             )[0],
         )
