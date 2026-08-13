@@ -106,6 +106,7 @@ from vllm.multimodal.video_prune.vidcom2 import (
 from vllm.multimodal.video_prune.vidcom2 import (
     compute_retention_mask as vidcom2_compute_retention_mask,
 )
+from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.tokenizers.protocol import TokenizerLike
 from vllm.tokenizers.registry import cached_tokenizer_from_config
@@ -709,7 +710,7 @@ class Qwen3_VisionTransformer(nn.Module):
         pinned = torch.empty(
             (num_pos, pos_ids[0].shape[1]),
             dtype=pos_ids[0].dtype,
-            pin_memory=True,
+            pin_memory=current_platform.is_pin_memory_available(),
         )
         pos_ids = torch.cat(pos_ids, dim=0, out=pinned).to(
             self.device, non_blocking=True
