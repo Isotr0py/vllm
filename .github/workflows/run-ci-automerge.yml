@@ -1,0 +1,34 @@
+name: Run CI when auto-merge is enabled
+
+on:
+  pull_request_target:
+    types: [auto_merge_enabled]
+
+concurrency:
+  group: run-ci-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  run-ci:
+    runs-on: [self-hosted, linux, x64, vllm-runners]
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
+        with:
+          python-version: "3.12"
+      - name: Trigger CI for the current PR head
+        run: >-
+          uv run --no-project --python 3.12
+          .github/workflows/scripts/run_ci_command.py
+        env:
+          BUILDKITE_API_TOKEN: ${{ secrets.BUILDKITE_API_TOKEN }}
+          BUILDKITE_ORGANIZATION: vllm
+          BUILDKITE_PIPELINE: ci
+          GH_TOKEN: ${{ github.token }}
