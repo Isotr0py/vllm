@@ -166,10 +166,12 @@ class IpcModelLoader(BaseModelLoader):
                 )
             self._apply_entries(model, entries, aliases, device_index)
             # process_weights_after_loading is intentionally skipped: the server
-            # exports the already-processed state. Materializing leftovers runs
-            # after applying entries so that placeholders for parameters the
-            # server-side post-processing consumed are dropped rather than
-            # filled with uninitialized memory.
+            # exports the already-processed state. Per-layer Python state that
+            # tensor export cannot carry (e.g. the MoE kernel) is rebuilt
+            # lazily on first use by the quant methods themselves.
+            # Materializing leftovers runs after applying entries so that
+            # placeholders for parameters the server-side post-processing
+            # consumed are dropped rather than filled with uninitialized memory.
             _materialize_remaining_meta_tensors(
                 model, torch.device(target_device.type, device_index)
             )
