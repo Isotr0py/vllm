@@ -27,7 +27,11 @@ from vllm.model_executor.layers.fused_moe.oracle.unquantized import (
 from vllm.model_executor.layers.fused_moe.runner.shared_experts import (
     SharedExperts,
 )
-from vllm.model_executor.utils import replace_parameter, set_weight_attrs
+from vllm.model_executor.utils import (
+    is_weights_pre_processed,
+    replace_parameter,
+    set_weight_attrs,
+)
 from vllm.platforms import current_platform
 
 if TYPE_CHECKING:
@@ -42,6 +46,8 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
     """MoE method without quantization."""
 
     # --8<-- [end:unquantized_fused_moe]
+
+    supports_pre_processed_weights = True
 
     def __init__(self, moe: FusedMoEConfig):
         super().__init__(moe)
@@ -177,15 +183,13 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
             routing_tables=layer._expert_routing_tables(),
         )
 
-    def _ensure_moe_kernel(self, layer: "RoutedExperts") -> None:
-        if self.moe_kernel is None:
-            # Normally built in process_weights_after_loading; rebuild lazily
-            # so a model whose post-processed weights were loaded out of band
-            # (weight cache IPC) recovers without re-running post-processing.
-            self._init_moe_kernel(layer)
-
     def process_weights_after_loading(self, layer: "RoutedExperts") -> None:
         super().process_weights_after_loading(layer)
+
+        if is_weights_pre_processed():
+            # Weights are already in runtime format; rebuild the kernel only.
+            self._init_moe_kernel(layer)
+            return
 
         # Padding the weight for better performance on ROCm.
         # _maybe_pad_weight is idempotent: on the first call it allocates a
@@ -255,7 +259,6 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         shared_experts: SharedExperts | None,
         shared_experts_input: torch.Tensor | None,
     ) -> torch.Tensor:
-        self._ensure_moe_kernel(layer)
         return self.forward(
             layer=layer,
             x=x,
@@ -315,7 +318,6 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         input_ids: torch.Tensor | None = None,
     ) -> torch.Tensor | UnfinalizedMoEOutput:
         assert self.is_monolithic
-        self._ensure_moe_kernel(layer)
         assert self.moe_kernel is not None
         return self.moe_kernel.apply_monolithic(
             x,

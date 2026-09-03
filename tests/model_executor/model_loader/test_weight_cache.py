@@ -267,6 +267,75 @@ def test_check_supported_rejects_quantized_kv_cache():
         loader._check_supported(vllm_config, model_config)
 
 
+def _make_model_with_method(method) -> torch.nn.Module:
+    model = torch.nn.Module()
+    model.linear = torch.nn.Linear(2, 2)
+    model.linear.quant_method = method
+    return model
+
+
+def _fake_model_config():
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        word_embeddings_untied_by_checkpoint=False,
+        quantization=None,
+        dtype=torch.float32,
+    )
+
+
+def test_pre_processed_mode_rejects_undeclared_method():
+    from vllm.model_executor.layers.quantization.base_config import (
+        QuantizeMethodBase,
+    )
+    from vllm.model_executor.model_loader.utils import process_weights_after_loading
+    from vllm.model_executor.utils import weights_already_processed
+
+    class _Method(QuantizeMethodBase):
+        def create_weights(self, *args, **kwargs):
+            pass
+
+        def apply(self, *args, **kwargs):
+            pass
+
+    model = _make_model_with_method(_Method())
+
+    with (
+        weights_already_processed(),
+        pytest.raises(RuntimeError, match="_Method"),
+    ):
+        process_weights_after_loading(model, _fake_model_config(), torch.device("cpu"))
+
+
+def test_pre_processed_mode_allows_declared_method():
+    from vllm.model_executor.layers.quantization.base_config import (
+        QuantizeMethodBase,
+    )
+    from vllm.model_executor.model_loader.utils import process_weights_after_loading
+    from vllm.model_executor.utils import (
+        is_weights_pre_processed,
+        weights_already_processed,
+    )
+
+    class _Method(QuantizeMethodBase):
+        supports_pre_processed_weights = True
+
+        def create_weights(self, *args, **kwargs):
+            pass
+
+        def apply(self, *args, **kwargs):
+            pass
+
+        def process_weights_after_loading(self, layer):
+            layer.saw_pre_processed_flag = is_weights_pre_processed()
+
+    model = _make_model_with_method(_Method())
+    with weights_already_processed():
+        process_weights_after_loading(model, _fake_model_config(), torch.device("cpu"))
+
+    assert model.linear.saw_pre_processed_flag is True
+
+
 def _ipc_producer(conn, done) -> None:
     tensor = torch.arange(16, dtype=torch.float32, device="cuda").reshape(4, 4)
     conn.send(TensorEntry.from_tensor(tensor, "param"))

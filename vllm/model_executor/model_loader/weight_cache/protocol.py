@@ -54,13 +54,12 @@ class UnsupportedQuantForIPCError(Exception):
 
 
 # The server exports tensor data only, so sharing is correct just for methods
-# whose post-load effect is either fully captured by that data or lazily
-# rebuilt on first use (e.g. the unquantized MoE kernel). Methods that repack
-# weights into shapes the meta-initialized client cannot reproduce (per-tensor
-# FP8 transposes layer.weight; Marlin/AWQ/GPTQ reorder) or that stamp
-# Python-side state they cannot rebuild would serve silently-wrong numerics,
-# so anything absent from this registry hard-errors. Extend it only after an
-# end-to-end check against a disk-loaded baseline.
+# whose post-load effect is either fully captured by that data or rebuilt when
+# process_weights_after_loading runs under weights_already_processed. Anything
+# absent from this registry hard-errors: a method that silently repacks into
+# shapes the client cannot reproduce or stamps unrebuildable Python-side state
+# would serve wrong numerics. Extend it only after an end-to-end check against
+# a disk-loaded baseline.
 
 
 # quantization name -> predicate(quant_config) -> True when verified safe.

@@ -15,7 +15,10 @@ from vllm.config.load import LoadConfig
 from vllm.logger import init_logger
 from vllm.model_executor.model_loader.base_loader import BaseModelLoader
 from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
-from vllm.model_executor.model_loader.utils import initialize_model
+from vllm.model_executor.model_loader.utils import (
+    initialize_model,
+    process_weights_after_loading,
+)
 from vllm.model_executor.model_loader.weight_cache.protocol import (
     TensorEntry,
     UnsupportedQuantForIPCError,
@@ -29,6 +32,7 @@ from vllm.model_executor.model_loader.weight_cache.protocol import (
     send_msg,
     verify_socket_owner,
 )
+from vllm.model_executor.utils import weights_already_processed
 from vllm.tracing import instrument
 from vllm.utils.torch_utils import set_default_torch_dtype
 
@@ -165,13 +169,14 @@ class IpcModelLoader(BaseModelLoader):
                     prefix=prefix,
                 )
             self._apply_entries(model, entries, aliases, device_index)
-            # process_weights_after_loading is intentionally skipped: the server
-            # exports the already-processed state. Per-layer Python state that
-            # tensor export cannot carry (e.g. the MoE kernel) is rebuilt
-            # lazily on first use by the quant methods themselves.
-            # Materializing leftovers runs after applying entries so that
-            # placeholders for parameters the server-side post-processing
-            # consumed are dropped rather than filled with uninitialized memory.
+            # The server exports tensors that already went through
+            # process_weights_after_loading; re-run it in pre-processed mode
+            # so quant methods only rebuild Python-side state (e.g. the MoE
+            # kernel). Leftovers are materialized afterwards so that
+            # placeholders the server-side post-processing consumed are
+            # dropped rather than filled with uninitialized memory.
+            with weights_already_processed():
+                process_weights_after_loading(model, model_config, target_device)
             _materialize_remaining_meta_tensors(
                 model, torch.device(target_device.type, device_index)
             )
