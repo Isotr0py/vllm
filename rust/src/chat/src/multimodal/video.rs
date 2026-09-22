@@ -7,7 +7,9 @@
 use std::sync::Arc;
 
 use itertools::izip;
-use llm_multimodal::{FieldLayout, Modality, PreprocessedEncoderInputs, VideoClip};
+use llm_multimodal::{
+    FieldLayout, Modality, PreprocessedEncoderInputs, PromptReplacement, VideoClip,
+};
 use thiserror_ext::AsReport as _;
 use tracing::warn;
 use vllm_engine_core_client::protocol::dtype::ModelDtype;
@@ -16,6 +18,7 @@ use vllm_engine_core_client::protocol::multimodal::{
     SliceSpec,
 };
 
+use super::cache::{CacheLookup, merge_slots, put_or_inline_and_track};
 use super::{ModalitySupport, MultimodalModelInfo, PreparedItem, PreparedMedia, tensor};
 use crate::error::{Error, Result, bail_multimodal, multimodal};
 
@@ -32,6 +35,10 @@ impl MultimodalModelInfo {
     /// Unlike images, each clip runs through the preprocessor independently
     /// (a batch of one), so its tensors are complete per item and need no
     /// cross-item slicing.
+    ///
+    /// With the SHM processor cache enabled, cached clips skip preprocessing
+    /// entirely: their prompt replacements come from the cache shadow and
+    /// their feature data is the shm address item.
     pub(super) async fn prepare_videos(
         &self,
         clips: Vec<Arc<VideoClip>>,
@@ -41,28 +48,38 @@ impl MultimodalModelInfo {
         let support = self.video.as_ref().ok_or_else(|| Error::UnsupportedModality {
             modality: Modality::Video.to_string(),
         })?;
-        let mut replacements = Vec::with_capacity(clips.len());
-        let mut items = Vec::with_capacity(clips.len());
 
+        let mut slots = Vec::with_capacity(clips.len());
+        let mut miss_clips = Vec::new();
+        let mut miss_uuids = Vec::new();
         for (clip, uuid) in izip!(&clips, uuids) {
-            let preprocessed = self.preprocess_video_clip(support, Arc::clone(clip)).await?;
-            let mut clip_replacements =
-                support.spec.prompt_replacements_for(&self.context, &preprocessed)?;
-            if clip_replacements.len() != 1 {
-                bail_multimodal!(
-                    "expected exactly one prompt replacement per video clip, got {}",
-                    clip_replacements.len()
-                );
+            let lookup = match &self.mm_processor_cache {
+                Some(cache) => cache.lookup(&clip.hash, uuid),
+                None => CacheLookup::Miss(uuid),
+            };
+            match lookup {
+                CacheLookup::Hit(item, replacement) => slots.push(Some((item, replacement))),
+                CacheLookup::Miss(uuid) => {
+                    slots.push(None);
+                    miss_clips.push(Arc::clone(clip));
+                    miss_uuids.push(uuid);
+                }
             }
-            replacements.push(clip_replacements.pop().unwrap());
-            items.push(build_video_item(
-                support,
-                preprocessed,
-                clip.hash.clone(),
-                uuid,
-                model_dtype,
-            )?);
         }
+
+        let mut misses = Vec::with_capacity(miss_clips.len());
+        for (clip, uuid) in izip!(miss_clips, miss_uuids) {
+            let (replacement, mut item) =
+                self.preprocess_video_item(support, clip, uuid, model_dtype).await?;
+            item.data = put_or_inline_and_track(
+                self.mm_processor_cache.as_ref(),
+                &item.hash,
+                &replacement,
+                std::mem::take(&mut item.data),
+            );
+            misses.push((item, replacement));
+        }
+        let (replacements, items) = merge_slots(slots, misses);
 
         Ok(PreparedMedia {
             modality: Modality::Video,
@@ -70,6 +87,27 @@ impl MultimodalModelInfo {
             replacements,
             items,
         })
+    }
+
+    /// Preprocess one video clip and build its replacement and engine kwargs.
+    async fn preprocess_video_item(
+        &self,
+        support: &ModalitySupport,
+        clip: Arc<VideoClip>,
+        uuid: Option<String>,
+        model_dtype: ModelDtype,
+    ) -> Result<(PromptReplacement, PreparedItem)> {
+        let preprocessed = self.preprocess_video_clip(support, Arc::clone(&clip)).await?;
+        let mut clip_replacements =
+            support.spec.prompt_replacements_for(&self.context, &preprocessed)?;
+        if clip_replacements.len() != 1 {
+            bail_multimodal!(
+                "expected exactly one prompt replacement per video clip, got {}",
+                clip_replacements.len()
+            );
+        }
+        let item = build_video_item(support, preprocessed, clip.hash.clone(), uuid, model_dtype)?;
+        Ok((clip_replacements.pop().unwrap(), item))
     }
 
     /// Preprocess one decoded video clip with the model's resolved vision

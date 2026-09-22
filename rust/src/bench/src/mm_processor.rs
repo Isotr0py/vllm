@@ -157,6 +157,7 @@ pub async fn run_mm_processor(args: MmProcessorArgs, timing: MultiModalTimingSta
         handshake_port,
         data_parallel_size: args.engine.data_parallel_size,
         python_args,
+        envs: Vec::new(),
     };
     eprintln!(
         "Spawning managed headless engine: python={} model={} data_parallel_size={}",

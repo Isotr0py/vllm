@@ -27,6 +27,7 @@ use llm_multimodal::{
 use serde::{Deserialize, Serialize};
 use thiserror_ext::AsReport as _;
 use tracing::{Instrument as _, warn};
+use vllm_engine_core_client::mm_cache::MmProcessorShmCache;
 use vllm_engine_core_client::protocol::dtype::ModelDtype;
 use vllm_engine_core_client::protocol::multimodal::{MmFeatureSpec, MmFeatures, MmKwargsItem};
 use vllm_text::Prompt;
@@ -37,6 +38,7 @@ use crate::renderer::{MediaPartSource, RenderedPrompt};
 use crate::request::{ChatContent, ChatContentPart, ChatMessage, ChatRequest};
 
 mod audio;
+mod cache;
 mod expand;
 mod image;
 mod input;
@@ -45,6 +47,7 @@ mod preprocessed;
 mod tensor;
 mod video;
 
+use self::cache::MmProcessorCache;
 use self::expand::expand_prompt_token_ids;
 pub use self::input::MultimodalInput;
 use vllm_tracing::timing::{mm_request_span, mm_stage_span};
@@ -59,6 +62,9 @@ pub struct MultimodalModelInfo {
     media_connector: Arc<MediaConnector>,
     /// Maximum number of input items allowed per prompt for each modality.
     limit_mm_per_prompt: MmLimitPerPrompt,
+    /// SHM multimodal processor cache (P0 sender side), enabled by
+    /// `--mm-processor-cache-type shm`.
+    mm_processor_cache: Option<MmProcessorCache>,
 }
 
 /// Per-modality item-count limits configured by `--limit-mm-per-prompt`.
@@ -315,6 +321,17 @@ struct FetchedMedia {
     audio_uuids: Vec<Option<String>>,
 }
 
+impl FetchedMedia {
+    /// All media hashes across modalities, in per-modality request order.
+    fn hashes(&self) -> impl Iterator<Item = &str> {
+        self.images
+            .iter()
+            .map(|frame| frame.hash.as_str())
+            .chain(self.videos.iter().map(|clip| clip.hash.as_str()))
+            .chain(self.audios.iter().map(|clip| clip.hash.as_str()))
+    }
+}
+
 /// One modality's preprocessed output, ready for the shared expansion and
 /// feature-assembly tail.
 struct PreparedMedia {
@@ -421,6 +438,7 @@ impl MultimodalModelInfo {
             audio,
             media_connector,
             limit_mm_per_prompt,
+            mm_processor_cache: None,
         }))
     }
 
@@ -522,6 +540,15 @@ impl MultimodalModelInfo {
             placeholder: ResolvedPlaceholder::resolve(raw_spec, context, Modality::Audio)?,
             processor,
         }))
+    }
+
+    /// Attach (or detach) the SHM multimodal processor cache.
+    ///
+    /// With the cache set, repeated media skips preprocessing and ships its
+    /// shm address to the engine instead of the full tensor payload.
+    pub fn with_mm_processor_cache(mut self, cache: Option<Arc<MmProcessorShmCache>>) -> Self {
+        self.mm_processor_cache = cache.map(MmProcessorCache::new);
+        self
     }
 
     /// Return the template-visible placeholder token for one modality, when
@@ -723,6 +750,9 @@ impl MultimodalModelInfo {
     /// this model's supported modalities and item-count limits.
     ///
     /// `prompt_len` must include all expanded multimodal placeholders.
+    ///
+    /// TODO: SHM processor-cache support for preprocessed inputs is future
+    /// work; this path always carries inline feature data.
     pub(crate) fn prepare_preprocessed(
         &self,
         mut features: MmFeatures,
@@ -777,6 +807,17 @@ impl MultimodalModelInfo {
         self.validate_mm_limits(&media_parts)?;
         let fetched =
             self.fetch_media(media_parts).instrument(mm_stage_span("media_fetch")).await?;
+
+        // Pre-touch every mm hash of the request before any per-item get/put,
+        // mirroring the pre-touch in Python's `_merge_mm_kwargs`. Combined
+        // with the writer-flag accounting, a probed-hit item cannot be
+        // evicted before this request's `address_item_for_cached` /
+        // `put_or_inline` calls.
+        if let Some(cache) = &self.mm_processor_cache {
+            for hash in fetched.hashes() {
+                cache.touch(hash);
+            }
+        }
 
         let mut prepared = Vec::new();
         if !fetched.images.is_empty() {

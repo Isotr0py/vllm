@@ -5,6 +5,7 @@ mod client;
 mod coordinator;
 mod error;
 mod metrics;
+pub mod mm_cache;
 pub mod mock_engine;
 pub mod protocol;
 pub mod runtime;

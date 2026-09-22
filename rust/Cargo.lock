@@ -5753,6 +5753,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "asynk-strim-attr",
+ "base64 0.22.1",
  "bytes",
  "clap",
  "easy-ext",
@@ -5765,6 +5766,7 @@ dependencies = [
  "minijinja-contrib",
  "ndarray",
  "oss-harmony",
+ "parking_lot",
  "paste",
  "reqwest 0.13.4",
  "rmp-serde",
@@ -5840,6 +5842,7 @@ dependencies = [
  "half",
  "hex",
  "itertools 0.14.0",
+ "libc",
  "parking_lot",
  "rmp-serde",
  "rmpv",

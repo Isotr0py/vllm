@@ -46,6 +46,10 @@ pub struct ManagedEngineConfig {
     pub data_parallel_size: usize,
     /// Extra CLI arguments forwarded verbatim to Python vLLM.
     pub python_args: Vec<String>,
+    /// Extra environment variables set on the managed engine child process,
+    /// e.g. `VLLM_OBJECT_STORAGE_SHM_BUFFER_NAME` for the shm multi-modal
+    /// processor cache.
+    pub envs: Vec<(String, String)>,
 }
 
 impl ManagedEngineConfig {
@@ -70,6 +74,7 @@ impl ManagedEngineConfig {
             .arg("--data-parallel-size")
             .arg(self.data_parallel_size.to_string())
             .args(&self.python_args);
+        command.envs(self.envs.iter().map(|(key, value)| (key, value)));
         command
     }
 }
@@ -228,6 +233,10 @@ mod tests {
                 "--max-model-len".to_string(),
                 "512".to_string(),
             ],
+            envs: vec![(
+                "VLLM_OBJECT_STORAGE_SHM_BUFFER_NAME".to_string(),
+                "vllm-mm-shm-test".to_string(),
+            )],
         };
         let command = config.to_command();
         let args = command.get_args().collect::<Vec<_>>();
@@ -256,6 +265,19 @@ mod tests {
             ]
         "#]]
         .assert_debug_eq(&args);
+
+        let envs = command.get_envs().collect::<Vec<_>>();
+        expect![[r#"
+            [
+                (
+                    "VLLM_OBJECT_STORAGE_SHM_BUFFER_NAME",
+                    Some(
+                        "vllm-mm-shm-test",
+                    ),
+                ),
+            ]
+        "#]]
+        .assert_debug_eq(&envs);
     }
 
     #[test]
