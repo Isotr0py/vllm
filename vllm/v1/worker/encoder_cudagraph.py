@@ -490,13 +490,38 @@ class EncoderCudaGraphManager:
             }
             batches.append((list(current_batch), path_budgets))
 
+        def should_defer_item(item_tokens: dict[str, int]) -> bool:
+            """Defer the item if closing the current batch strictly reduces
+            the summed token budgets on any path the item has tokens for."""
+            for path in paths:
+                if item_tokens[path] == 0:
+                    continue
+                budgets = self.path_token_budgets[path]
+                cur = current_tokens[path]
+                b_cur = (
+                    0
+                    if cur == 0
+                    else self._find_smallest_fitting_budget_given_tokens(cur, budgets)
+                )
+                b_merged = self._find_smallest_fitting_budget_given_tokens(
+                    cur + item_tokens[path], budgets
+                )
+                b_alone = self._find_smallest_fitting_budget_given_tokens(
+                    item_tokens[path], budgets
+                )
+                if b_cur is None or b_merged is None or b_alone is None:
+                    continue
+                if b_cur + b_alone < b_merged:
+                    return True
+            return False
+
         for orig_idx in sorted_indices:
             item_tokens = {path: per_item_path_tokens[path][orig_idx] for path in paths}
             fits = len(current_batch) < self.max_batch_size and all(
                 current_tokens[path] + item_tokens[path] <= max_path_budgets[path]
                 for path in paths
             )
-            if current_batch and not fits:
+            if current_batch and (not fits or should_defer_item(item_tokens)):
                 append_current_batch()
                 current_batch = []
                 current_tokens = dict.fromkeys(paths, 0)
