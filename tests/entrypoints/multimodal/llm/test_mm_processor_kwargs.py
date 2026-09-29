@@ -337,9 +337,7 @@ def llava_llm():
     # A real multimodal model (Llama tokenizer, BOS=1) so that the real
     # processor default (`add_special_tokens=True`) is in play. Only
     # config/tokenizer/processor files are fetched, no weights.
-    model_config = ModelConfig(
-        model="llava-hf/llava-interleave-qwen-0.5b-hf", max_model_len=128
-    )
+    model_config = ModelConfig(model="llava-hf/llava-1.5-7b-hf", max_model_len=128)
     renderer = HfRenderer(
         VllmConfig(model_config=model_config),
         cached_tokenizer_from_config(model_config),
