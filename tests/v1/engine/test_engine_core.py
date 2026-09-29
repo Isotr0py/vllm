@@ -524,7 +524,7 @@ def test_encoder_instance_zero_kv_cache(
     """
     # Form vllm config
     model_config = ModelConfig(
-        model="llava-hf/llava-1.5-7b-hf",  # Multimodal model
+        model="llava-hf/llava-interleave-qwen-0.5b-hf",  # Multimodal model
         enforce_eager=True,
         trust_remote_code=True,
         dtype="float16",

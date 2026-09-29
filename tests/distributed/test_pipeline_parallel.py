@@ -164,7 +164,7 @@ MULTIMODAL_MODELS = {
     "Salesforce/blip2-opt-6.7b": PPTestSettings.fast(),
     "zai-org/glm-4v-9b": PPTestSettings.fast(),
     "OpenGVLab/InternVL3-1B": PPTestSettings.fast(),
-    "llava-hf/llava-1.5-7b-hf": PPTestSettings.fast(),
+    "llava-hf/llava-interleave-qwen-0.5b-hf": PPTestSettings.fast(),
     "llava-hf/llava-v1.6-mistral-7b-hf": PPTestSettings.fast(),
     "llava-hf/LLaVA-NeXT-Video-7B-hf": PPTestSettings.fast(),
     "llava-hf/llava-onevision-qwen2-0.5b-ov-hf": PPTestSettings.fast(),

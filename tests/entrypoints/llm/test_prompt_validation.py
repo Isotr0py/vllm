@@ -26,7 +26,7 @@ def test_out_of_vocab_token(vllm_runner):
 def test_require_mm_embeds(vllm_runner):
     with (
         vllm_runner(
-            "llava-hf/llava-1.5-7b-hf",
+            "llava-hf/llava-interleave-qwen-0.5b-hf",
             enforce_eager=True,
             enable_mm_embeds=False,
         ) as runner,

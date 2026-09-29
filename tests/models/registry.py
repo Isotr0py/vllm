@@ -1095,7 +1095,7 @@ _MULTIMODAL_EXAMPLE_MODELS = {
         extras={"llama-guard-4": "meta-llama/Llama-Guard-4-12B"},
     ),
     "LlavaForConditionalGeneration": _HfExamplesInfo(
-        "llava-hf/llava-1.5-7b-hf",
+        "llava-hf/llava-interleave-qwen-0.5b-hf",
         extras={
             "mistral": "mistral-community/pixtral-12b",
             "mistral-fp8": "nm-testing/pixtral-12b-FP8-dynamic",

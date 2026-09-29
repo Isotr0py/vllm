@@ -111,7 +111,7 @@ def _granite4_vision_vllm_to_hf_output(vllm_output, model):
 VLM_TEST_SETTINGS = {
     #### Core tests to always run in the CI
     "llava": VLMTestInfo(
-        models=["llava-hf/llava-1.5-7b-hf"],
+        models=["llava-hf/llava-interleave-qwen-0.5b-hf"],
         test_type=(VLMTestType.EMBEDDING, VLMTestType.IMAGE, VLMTestType.CUSTOM_INPUTS),
         prompt_formatter=lambda img_prompt: f"USER: {img_prompt}\nASSISTANT:",
         convert_assets_to_embeddings=model_utils.get_llava_embeddings,
@@ -925,7 +925,7 @@ VLM_TEST_SETTINGS = {
     ),
     ### Tensor parallel / multi-gpu broadcast tests
     "llava-broadcast": VLMTestInfo(
-        models=["llava-hf/llava-1.5-7b-hf"],
+        models=["llava-hf/llava-interleave-qwen-0.5b-hf"],
         prompt_formatter=lambda img_prompt: f"USER: {img_prompt}\nASSISTANT:",
         max_model_len=4096,
         auto_cls=AutoModelForImageTextToText,

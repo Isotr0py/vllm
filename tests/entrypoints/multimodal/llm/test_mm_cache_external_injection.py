@@ -79,7 +79,7 @@ def test_inject_into_mm_cache(
        then generate with a pre-rendered input -> verifies injection works
     """
     with vllm_runner(
-        "llava-hf/llava-1.5-7b-hf",
+        "llava-hf/llava-interleave-qwen-0.5b-hf",
         max_model_len=4096,
         max_num_seqs=5,
         enforce_eager=True,
@@ -150,7 +150,7 @@ def test_inject_into_mm_cache_without_cache(
     is disabled (mm_processor_cache_gb=0). Should not crash.
     """
     with vllm_runner(
-        "llava-hf/llava-1.5-7b-hf",
+        "llava-hf/llava-interleave-qwen-0.5b-hf",
         max_model_len=4096,
         max_num_seqs=5,
         enforce_eager=True,

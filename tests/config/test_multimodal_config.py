@@ -73,7 +73,7 @@ def test_language_model_only_does_not_affect_mm_hash():
 def test_language_model_only_affects_model_hash():
     """language_model_only affects the LM computation graph,
     so it should change the model config hash."""
-    model = "llava-hf/llava-1.5-7b-hf"
+    model = "llava-hf/llava-interleave-qwen-0.5b-hf"
     base_hash = ModelConfig(model).compute_hash()
     lm_only_hash = ModelConfig(model, language_model_only=True).compute_hash()
     assert base_hash != lm_only_hash
@@ -106,7 +106,7 @@ def test_mm_encoder_attn_dtype_hash_updates(tmp_path):
     assert fp8_hash != fp8_static_hash
 
 
-_MULTIMODAL_MODEL = "llava-hf/llava-1.5-7b-hf"
+_MULTIMODAL_MODEL = "llava-hf/llava-interleave-qwen-0.5b-hf"
 _TEXT_ONLY_MODEL = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
 
 

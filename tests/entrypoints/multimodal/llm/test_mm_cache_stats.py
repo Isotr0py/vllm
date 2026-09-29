@@ -64,7 +64,7 @@ def test_mm_cache_stats(
     vllm_runner,
 ):
     with vllm_runner(
-        "llava-hf/llava-1.5-7b-hf",
+        "llava-hf/llava-interleave-qwen-0.5b-hf",
         max_model_len=4096,
         max_num_seqs=5,
         enforce_eager=True,

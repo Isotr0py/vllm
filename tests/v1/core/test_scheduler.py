@@ -300,7 +300,7 @@ def test_scheduler_stats_route_to_existing_output_client():
 
 
 def test_schedule_multimodal_requests():
-    scheduler = create_scheduler(model="llava-hf/llava-1.5-7b-hf")
+    scheduler = create_scheduler(model="llava-hf/llava-interleave-qwen-0.5b-hf")
     mm_positions = [[PlaceholderRange(offset=i, length=100)] for i in range(10)]
     requests = create_requests(
         num_requests=10,
@@ -383,7 +383,7 @@ def test_schedule_partial_requests():
        there is insufficient encoder budget.
     """
     scheduler = create_scheduler(
-        model="llava-hf/llava-1.5-7b-hf",
+        model="llava-hf/llava-interleave-qwen-0.5b-hf",
         max_num_batched_tokens=1024,
     )
     mm_positions = [[PlaceholderRange(offset=100, length=600)] for _ in range(3)]
@@ -643,7 +643,7 @@ def test_throttle_capacity_bound_guard_admits():
 def test_no_mm_input_chunking():
     # Disable multimodal input chunking.
     scheduler = create_scheduler(
-        model="llava-hf/llava-1.5-7b-hf",
+        model="llava-hf/llava-interleave-qwen-0.5b-hf",
         max_num_batched_tokens=1024,
         disable_chunked_mm_input=True,
         max_model_len=2048,
@@ -684,7 +684,7 @@ def test_no_mm_input_chunking():
     # of a max_num_batched_tokens for the mm input.
     with pytest.raises(ValueError):
         _ = create_scheduler(
-            model="llava-hf/llava-1.5-7b-hf",
+            model="llava-hf/llava-interleave-qwen-0.5b-hf",
             max_num_batched_tokens=100,
             disable_chunked_mm_input=True,
         )
@@ -4341,7 +4341,7 @@ def test_mamba_align_eagle_schedules_encoder_at_boundary():
 def test_ec_connector_text_only_request(use_kv_connector):
     """Test text-only requests don't allocate encoder cache."""
     scheduler = create_scheduler(
-        model="llava-hf/llava-1.5-7b-hf",
+        model="llava-hf/llava-interleave-qwen-0.5b-hf",
         use_kv_connector=use_kv_connector,
         use_ec_connector=True,
         ec_role="ec_consumer",
@@ -4383,7 +4383,7 @@ def test_ec_connector_cache_hit_external_load(use_kv_connector):
     """Test ec_consumer loads from external cache when hit.
     A normal basic operation for EPD disaggrgation"""
     scheduler = create_scheduler(
-        model="llava-hf/llava-1.5-7b-hf",
+        model="llava-hf/llava-interleave-qwen-0.5b-hf",
         enable_prefix_caching=True,
         # kv connector should not effect test results
         use_kv_connector=use_kv_connector,
@@ -4435,7 +4435,7 @@ def test_ec_connector_cache_miss_computes_locally(use_kv_connector):
     # encoder cache itself if it doesn't receive it from external storage
 
     scheduler = create_scheduler(
-        model="llava-hf/llava-1.5-7b-hf",
+        model="llava-hf/llava-interleave-qwen-0.5b-hf",
         enable_prefix_caching=True,
         use_kv_connector=use_kv_connector,
         use_ec_connector=True,
@@ -4489,7 +4489,7 @@ def test_ec_connector_cache_miss_computes_locally(use_kv_connector):
 def test_ec_connector_with_partial_cache_hit_multi_round(use_kv_connector):
     """Test consumer with partial cache hit (local & connector) with 2 requests."""
     scheduler = create_scheduler(
-        model="llava-hf/llava-1.5-7b-hf",
+        model="llava-hf/llava-interleave-qwen-0.5b-hf",
         enable_prefix_caching=True,
         use_kv_connector=use_kv_connector,
         use_ec_connector=True,
@@ -4642,7 +4642,7 @@ def test_ec_connector_with_partial_cache_hit_multi_round(use_kv_connector):
 @pytest.mark.parametrize("use_kv_connector", [False, True])
 def test_ec_connector_schedule_multiple_requests(cache_exist, use_kv_connector):
     scheduler = create_scheduler(
-        model="llava-hf/llava-1.5-7b-hf",
+        model="llava-hf/llava-interleave-qwen-0.5b-hf",
         max_num_seqs=10,  # allow multiple requests
         max_num_batched_tokens=2048,
         enable_prefix_caching=True,
@@ -4736,7 +4736,7 @@ def test_ec_connector_unable_to_allocate(use_kv_connector):
     BLOCK_SIZE = 4
     NUM_BLOCKS = 10
     scheduler = create_scheduler(
-        model="llava-hf/llava-1.5-7b-hf",
+        model="llava-hf/llava-interleave-qwen-0.5b-hf",
         enable_prefix_caching=True,
         use_kv_connector=use_kv_connector,
         block_size=BLOCK_SIZE,
@@ -4831,7 +4831,7 @@ def test_priority_scheduling_ec_connector_preemption_and_resumption(
     when out of KV cache space."""
     # Create scheduler with very limited memory to force preemption
     scheduler = create_scheduler_with_priority(
-        model="llava-hf/llava-1.5-7b-hf",
+        model="llava-hf/llava-interleave-qwen-0.5b-hf",
         enable_prefix_caching=True,
         max_num_seqs=2,  # allow multiple requests
         # kv connector should not effect test results
@@ -5071,7 +5071,7 @@ def test_ec_connector_allocate_encoder_tokens_with_external_load(use_kv_connecto
       3. Free A's cache, then schedule B again (continuation) - schedule 3rd image
     """
     scheduler = create_scheduler(
-        model="llava-hf/llava-1.5-7b-hf",
+        model="llava-hf/llava-interleave-qwen-0.5b-hf",
         max_num_batched_tokens=1024,
         enable_prefix_caching=True,
         use_kv_connector=use_kv_connector,
@@ -5580,7 +5580,7 @@ def test_ec_connector_update_connector_output_called():
     """Test that worker-side EC connector output is forwarded to the
     EC connector's update_connector_output hook."""
     scheduler = create_scheduler(
-        model="llava-hf/llava-1.5-7b-hf",
+        model="llava-hf/llava-interleave-qwen-0.5b-hf",
         use_ec_connector=True,
         ec_role="ec_consumer",
     )
@@ -5917,7 +5917,7 @@ def test_eagle3_mm_encoder_cache_with_shift():
     at the boundary, causing "Encoder cache miss" errors.
     """
     scheduler = create_scheduler(
-        model="llava-hf/llava-1.5-7b-hf",
+        model="llava-hf/llava-interleave-qwen-0.5b-hf",
         max_num_batched_tokens=1024,
         disable_chunked_mm_input=True,
         max_model_len=2048,
@@ -5986,7 +5986,7 @@ def test_free_encoder_inputs_respects_unconfirmed_placeholders():
     (num_computed_tokens - num_output_placeholders) passes the range end, so
     that no pending rejection can rewind into the range."""
     scheduler = create_scheduler(
-        model="llava-hf/llava-1.5-7b-hf",
+        model="llava-hf/llava-interleave-qwen-0.5b-hf",
         num_speculative_tokens=3,
     )
     mm_start_pos = 50
@@ -6034,7 +6034,7 @@ def test_free_encoder_inputs_notifies_the_ec_connector():
     Connectors hold per-item transfer state (remote buffers, reservations);
     waiting for `request_finished` pins it for the whole generation.
     """
-    scheduler = create_scheduler(model="llava-hf/llava-1.5-7b-hf")
+    scheduler = create_scheduler(model="llava-hf/llava-interleave-qwen-0.5b-hf")
     mm_start_pos, mm_length = 50, 100
     request = create_requests(
         num_requests=1,
@@ -6060,7 +6060,7 @@ def test_unavailable_encoder_input_fails_the_request_as_retryable():
     for load failures, so the caller can re-issue; deferring instead parked the
     request until the client timed out.
     """
-    scheduler = create_scheduler(model="llava-hf/llava-1.5-7b-hf")
+    scheduler = create_scheduler(model="llava-hf/llava-interleave-qwen-0.5b-hf")
     request = create_requests(
         num_requests=1,
         num_tokens=160,
@@ -6112,7 +6112,7 @@ def _create_mm_request_with_embedding_positions(
 
 def test_encoder_cache_accepts_matching_embed_count():
     """An actively referenced entry is reused when embedding counts match."""
-    scheduler = create_scheduler(model="llava-hf/llava-1.5-7b-hf")
+    scheduler = create_scheduler(model="llava-hf/llava-interleave-qwen-0.5b-hf")
     identifier = "reused-client-uuid"
     owner = _create_mm_request_with_embedding_positions(
         "owner", identifier, [True, True, True, False, False, False]
@@ -6132,7 +6132,7 @@ def test_encoder_cache_accepts_matching_embed_count():
 
 def test_encoder_cache_rejects_mismatched_embed_count(caplog_vllm):
     """A completed request's freeable entry rejects an incompatible reuse."""
-    scheduler = create_scheduler(model="llava-hf/llava-1.5-7b-hf")
+    scheduler = create_scheduler(model="llava-hf/llava-interleave-qwen-0.5b-hf")
     identifier = "reused-client-uuid"
     owner = _create_mm_request_with_embedding_positions(
         "owner", identifier, [True, True, True, False, False, False]
@@ -6180,7 +6180,7 @@ def test_encoder_cache_rejects_mismatched_embed_count(caplog_vllm):
 
 def test_encoder_cache_embed_count_mismatch_restores_prior_hit_state():
     """A prior hit is released when a later mismatch fails the request."""
-    scheduler = create_scheduler(model="llava-hf/llava-1.5-7b-hf")
+    scheduler = create_scheduler(model="llava-hf/llava-interleave-qwen-0.5b-hf")
     manager = scheduler.encoder_cache_manager
     valid_identifier = "valid-reuse"
     mismatch_identifier = "mismatched-reuse"
@@ -6243,7 +6243,7 @@ def test_encoder_cache_embed_count_mismatch_restores_prior_hit_state():
 
 def test_encoder_cache_rejects_mismatched_embed_count_within_request():
     """One request cannot reuse an identifier with a different embed count."""
-    scheduler = create_scheduler(model="llava-hf/llava-1.5-7b-hf")
+    scheduler = create_scheduler(model="llava-hf/llava-interleave-qwen-0.5b-hf")
     identifier = "reused-within-request"
     request = create_requests(
         num_requests=1,
@@ -6291,7 +6291,7 @@ def test_free_encoder_inputs_defers_for_eagle_lookahead():
     position past the target's computed range) still finds it cached. This is
     the primary mechanism that prevents the drafter "Encoder cache miss"; the
     worker-side token-embedding fallback is only a backstop."""
-    scheduler = create_scheduler(model="llava-hf/llava-1.5-7b-hf")
+    scheduler = create_scheduler(model="llava-hf/llava-interleave-qwen-0.5b-hf")
     # create_scheduler only builds ngram spec configs; force the eagle path that
     # _free_encoder_inputs keys off (its read-ahead deferral).
     scheduler.use_eagle = True
@@ -6321,7 +6321,7 @@ def test_free_encoder_inputs_defers_for_eagle_lookahead():
 def test_free_encoder_inputs_unchanged_without_spec_decode():
     """Without speculative decoding, encoder inputs are freed as soon as
     num_computed_tokens passes the placeholder range, as before."""
-    scheduler = create_scheduler(model="llava-hf/llava-1.5-7b-hf")
+    scheduler = create_scheduler(model="llava-hf/llava-interleave-qwen-0.5b-hf")
     mm_positions = [[PlaceholderRange(offset=50, length=100)]]
     request = create_requests(
         num_requests=1,
@@ -6353,7 +6353,7 @@ def test_encoder_cache_retained_across_preemption_and_resume():
     consistent. The spec-rollback retention margin does not gate this path,
     so it is covered separately here."""
     scheduler = create_scheduler(
-        model="llava-hf/llava-1.5-7b-hf",
+        model="llava-hf/llava-interleave-qwen-0.5b-hf",
         num_speculative_tokens=3,
     )
     mm_positions = [[PlaceholderRange(offset=50, length=100)]]
@@ -6397,7 +6397,7 @@ def test_encoder_cache_recomputed_when_evicted_during_preemption():
     than assume the worker still holds it. check_and_update_cache must
     return False so the encoder input is re-scheduled."""
     scheduler = create_scheduler(
-        model="llava-hf/llava-1.5-7b-hf",
+        model="llava-hf/llava-interleave-qwen-0.5b-hf",
         num_speculative_tokens=3,
     )
     mm_positions = [[PlaceholderRange(offset=50, length=100)]]
@@ -6450,7 +6450,7 @@ def test_ec_connector_ensure_cache_available_defers_request(use_kv_connector):
        returns True and has_cache_item returns True
     """
     scheduler = create_scheduler(
-        model="llava-hf/llava-1.5-7b-hf",
+        model="llava-hf/llava-interleave-qwen-0.5b-hf",
         enable_prefix_caching=True,
         use_kv_connector=use_kv_connector,
         use_ec_connector=True,
@@ -6517,7 +6517,7 @@ def test_ec_connector_ensure_cache_available_defers_request(use_kv_connector):
 
 def test_ec_connector_defers_running_request_for_async_reload():
     scheduler = create_scheduler(
-        model="llava-hf/llava-1.5-7b-hf",
+        model="llava-hf/llava-interleave-qwen-0.5b-hf",
         max_num_batched_tokens=32,
         use_ec_connector=True,
         ec_role="ec_consumer",

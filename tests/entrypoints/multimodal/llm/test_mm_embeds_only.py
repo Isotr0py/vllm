@@ -9,7 +9,7 @@ from vllm import LLM, SamplingParams
 from vllm.assets.image import ImageAsset
 from vllm.exceptions import VLLMValidationError
 
-MODEL = "llava-hf/llava-1.5-7b-hf"
+MODEL = "llava-hf/llava-interleave-qwen-0.5b-hf"
 PROMPT = "USER: <image>\nDescribe this image briefly.\nASSISTANT:"
 TEXT_ONLY_PROMPT = "USER: What is 2 + 2?\nASSISTANT:"
 

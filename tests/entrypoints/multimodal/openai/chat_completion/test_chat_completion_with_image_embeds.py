@@ -14,7 +14,7 @@ from tests.utils import RemoteOpenAIServer
 from vllm.utils.serial_utils import tensor2base64
 
 # any model with a chat template should work here
-MODEL_NAME = "llava-hf/llava-1.5-7b-hf"
+MODEL_NAME = "llava-hf/llava-interleave-qwen-0.5b-hf"
 CONFIG = AutoConfig.from_pretrained(MODEL_NAME)
 MAXIMUM_IMAGES = 2
 

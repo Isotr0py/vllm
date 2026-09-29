@@ -14,7 +14,7 @@ HF_IMAGE_PROMPTS = IMAGE_ASSETS.prompts(
     }
 )
 
-models = ["llava-hf/llava-1.5-7b-hf"]
+models = ["llava-hf/llava-interleave-qwen-0.5b-hf"]
 
 
 @pytest.mark.parametrize("model", models)

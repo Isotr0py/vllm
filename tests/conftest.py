@@ -1573,7 +1573,7 @@ def dummy_llava_path():
     json_path = os.path.join(_dummy_llava_path, "config.json")
     if not os.path.exists(_dummy_llava_path):
         hf_api().snapshot_download(
-            repo_id="llava-hf/llava-1.5-7b-hf",
+            repo_id="llava-hf/llava-interleave-qwen-0.5b-hf",
             local_dir=_dummy_llava_path,
             ignore_patterns=[
                 "*.bin",
