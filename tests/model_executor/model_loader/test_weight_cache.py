@@ -710,28 +710,24 @@ def test_peer_seed_rejects_a_remapped_source_device():
 def _remote_seed_daemon(token):
     """Serve the daemon's remote seed plane on a loopback port.
 
-    Only that thread is exercised, so __init__ (which loads a model onto a
-    GPU) is skipped and just the state it touches is provided.
+    Only that thread is exercised, so the service is built without its
+    loading machinery and just the state the plane touches is provided.
     """
     from unittest.mock import patch
 
     import torch
 
-    from vllm.model_executor.model_loader.weight_cache.daemon import WeightCacheDaemon
+    from vllm.model_executor.model_loader.weight_cache.connector import (
+        DaemonConnector,
+    )
 
-    daemon = WeightCacheDaemon.__new__(WeightCacheDaemon)
-    daemon.seed_token = token
-    daemon.model = None
-    daemon.mirror = None
-    daemon.role = "target"
-    daemon.global_rank = 0
-    daemon.device_index = 0
-    daemon._state_lock = threading.Lock()
+    service = _bare_service()
+    connector = DaemonConnector(service, seed_token=token)
 
     server = socket.create_server(("127.0.0.1", 0))
     with patch.object(torch.accelerator, "set_device_index"):
         thread = threading.Thread(
-            target=daemon._serve_remote, args=(server,), daemon=True
+            target=connector._serve_remote, args=(server,), daemon=True
         )
         thread.start()
         try:
@@ -791,9 +787,9 @@ def test_remote_seed_plane_refuses_local_only_commands():
 def test_remote_seed_plane_drops_a_stalled_peer(monkeypatch):
     """A peer that connects and never sends its request must not hold the
     listener: it gets a deadline, and the next peer is still served."""
-    from vllm.model_executor.model_loader.weight_cache import daemon
+    from vllm.model_executor.model_loader.weight_cache import connector
 
-    monkeypatch.setattr(daemon, "_REMOTE_REQUEST_TIMEOUT_S", 0.5)
+    monkeypatch.setattr(connector, "_REMOTE_REQUEST_TIMEOUT_S", 0.5)
     with (
         _remote_seed_daemon("s3cret") as port,
         socket.create_connection(("127.0.0.1", port)),
@@ -804,9 +800,44 @@ def test_remote_seed_plane_drops_a_stalled_peer(monkeypatch):
     assert "released" in served["message"]
 
 
+def _bare_service():
+    """A service skipped past __init__'s config resolution, holding no
+    weights and no seed sources."""
+    from vllm.model_executor.model_loader.weight_cache.service import (
+        WeightCacheService,
+    )
+
+    service = WeightCacheService.__new__(WeightCacheService)
+    service.role = "target"
+    service.global_rank = 0
+    service.device_index = 0
+    service.model = None
+    service.mirror = None
+    service._seed_sources = {}
+    service.state_lock = threading.Lock()
+    return service
+
+
+def _serving_service(tmp_path, monkeypatch):
+    """A bare service with its autotune cache root and per-rank path pointed
+    under tmp_path."""
+    from vllm.model_executor.model_loader.weight_cache import (
+        service as service_module,
+    )
+
+    service = _bare_service()
+    monkeypatch.setattr(
+        service_module, "resolve_flashinfer_autotune_root", lambda: tmp_path
+    )
+    service._autotune_cache_path = (
+        lambda: tmp_path / "hash0" / "autotune_configs_dp0_rank0.json"
+    )
+    return service
+
+
 def _bare_daemon(tmp_path, monkeypatch):
-    """A daemon skipped past __init__'s model load, with its per-rank
-    autotune cache path and cache root pointed under tmp_path."""
+    """A daemon skipped past __init__'s model load, with the autotune cache
+    root pointed under tmp_path for the mirror-side adopt path."""
     from vllm.model_executor.model_loader.weight_cache import daemon as daemon_module
     from vllm.model_executor.model_loader.weight_cache.daemon import WeightCacheDaemon
 
@@ -816,9 +847,6 @@ def _bare_daemon(tmp_path, monkeypatch):
     monkeypatch.setattr(
         daemon_module, "resolve_flashinfer_autotune_root", lambda: tmp_path
     )
-    daemon._autotune_cache_path = (
-        lambda: tmp_path / "hash0" / "autotune_configs_dp0_rank0.json"
-    )
     return daemon
 
 
@@ -826,7 +854,7 @@ def test_read_autotune_cache_is_none_without_a_file(tmp_path, monkeypatch):
     """A daemon that never wrote a table (autotune disabled, or the
     single-GPU managed store) seeds None, and the mirror's first engine
     tunes for itself, as without seeding."""
-    assert _bare_daemon(tmp_path, monkeypatch)._read_autotune_cache() is None
+    assert _serving_service(tmp_path, monkeypatch)._read_autotune_cache() is None
 
 
 def test_read_autotune_cache_encodes_this_ranks_file(tmp_path, monkeypatch):
@@ -836,11 +864,11 @@ def test_read_autotune_cache_encodes_this_ranks_file(tmp_path, monkeypatch):
     a mirror never warms up."""
     import pybase64 as base64
 
-    daemon = _bare_daemon(tmp_path, monkeypatch)
-    path = daemon._autotune_cache_path()
+    service = _serving_service(tmp_path, monkeypatch)
+    path = service._autotune_cache_path()
     path.parent.mkdir(parents=True)
     path.write_bytes(b'{"op": 1}')
-    payload = daemon._read_autotune_cache()
+    payload = service._read_autotune_cache()
     assert payload is not None
     assert payload["rel"] == "hash0/autotune_configs_dp0_rank0.json"
     assert base64.b64decode(payload["data"]) == b'{"op": 1}'
@@ -851,15 +879,17 @@ def test_read_autotune_cache_drops_an_over_budget_file(tmp_path, monkeypatch, ca
     is skipped with a warning rather than failing the seed."""
     import logging
 
-    from vllm.model_executor.model_loader.weight_cache import daemon as daemon_module
+    from vllm.model_executor.model_loader.weight_cache import (
+        service as service_module,
+    )
 
-    monkeypatch.setattr(daemon_module, "_MAX_SEED_AUTOTUNE_BYTES", 4)
-    daemon = _bare_daemon(tmp_path, monkeypatch)
-    path = daemon._autotune_cache_path()
+    monkeypatch.setattr(service_module, "_MAX_SEED_AUTOTUNE_BYTES", 4)
+    service = _serving_service(tmp_path, monkeypatch)
+    path = service._autotune_cache_path()
     path.parent.mkdir(parents=True)
     path.write_bytes(b"x" * 8)
     with caplog.at_level(logging.WARNING):
-        assert daemon._read_autotune_cache() is None
+        assert service._read_autotune_cache() is None
     assert "seed budget" in caplog.text
 
 
@@ -932,25 +962,29 @@ def test_adopt_seeded_autotune_cache_ignores_an_unreadable_payload(
 def _seed_daemon(tmp_path, monkeypatch):
     """Serve the daemon's local fetch_manifest handler on a throwaway socket.
 
-    Only that handler is exercised, so __init__ (which loads a model onto a
-    GPU) is skipped and just the state it touches is provided.
+    Only that handler is exercised, so the service is built without its
+    loading machinery and just the state it touches is provided.
     """
     from types import SimpleNamespace
     from unittest.mock import patch
 
     import torch
 
-    from vllm.model_executor.model_loader.weight_cache import daemon as daemon_module
-    from vllm.model_executor.model_loader.weight_cache.daemon import MirrorState
+    from vllm.model_executor.model_loader.weight_cache import (
+        service as service_module,
+    )
+    from vllm.model_executor.model_loader.weight_cache.connector import (
+        DaemonConnector,
+    )
+    from vllm.model_executor.model_loader.weight_cache.service import MirrorState
 
-    daemon = _bare_daemon(tmp_path, monkeypatch)
-    daemon.model = None
-    daemon.mirror = MirrorState(
+    service = _serving_service(tmp_path, monkeypatch)
+    service.mirror = MirrorState(
         tensors={"weight": torch.zeros(2)}, kinds={"weight": "param"}
     )
-    daemon.model_config = SimpleNamespace(model="m")
-    daemon.cache_config = None
-    daemon._seed_sources = {}
+    service.model_config = SimpleNamespace(model="m")
+    service.cache_config = None
+    connector = DaemonConnector(service)
 
     socket_path = str(tmp_path / "daemon.sock")
     server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -964,16 +998,16 @@ def _seed_daemon(tmp_path, monkeypatch):
             except OSError:
                 return
             with conn:
-                daemon._handle_connection(conn)
+                connector._handle_local(conn)
 
     with (
         patch.object(torch.accelerator, "current_device_index", return_value=0),
-        patch.object(daemon_module, "get_current_device_uuid", return_value=None),
+        patch.object(service_module, "get_current_device_uuid", return_value=None),
     ):
         thread = threading.Thread(target=_serve, daemon=True)
         thread.start()
         try:
-            yield daemon, socket_path
+            yield service, socket_path
         finally:
             server.close()
             thread.join(timeout=5)
@@ -993,9 +1027,9 @@ def test_fetch_manifest_response_carries_the_autotune_cache(
         send_msg,
     )
 
-    with _seed_daemon(tmp_path, monkeypatch) as (daemon, socket_path):
+    with _seed_daemon(tmp_path, monkeypatch) as (service, socket_path):
         if contents is not None:
-            path = daemon._autotune_cache_path()
+            path = service._autotune_cache_path()
             path.parent.mkdir(parents=True)
             path.write_bytes(contents)
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:

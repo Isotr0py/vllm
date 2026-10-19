@@ -419,6 +419,8 @@ class WeightCacheState(NamedTuple):
     """Duplicate (tied) weight names aliased to their canonical entry."""
     attrs: dict[str, bool]
     """Python-side flags set by load_weights, e.g. EAGLE ownership flags."""
+    gpu_uuid: str | None = None
+    """The daemon's GPU UUID, so the client can catch a misrouted socket."""
 
 
 _HOST_PORT = re.compile(

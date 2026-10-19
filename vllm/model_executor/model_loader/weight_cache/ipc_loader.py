@@ -4,7 +4,6 @@
 daemon via CUDA IPC instead of loading from disk."""
 
 import dataclasses
-import socket
 import time
 from collections.abc import Callable
 from copy import copy
@@ -29,6 +28,7 @@ from vllm.model_executor.model_loader.utils import (
     initialize_model,
     process_weights_after_loading,
 )
+from vllm.model_executor.model_loader.weight_cache.connector import ClientConnector
 from vllm.model_executor.model_loader.weight_cache.protocol import (
     CacheConfigMismatchError,
     UnsupportedQuantForIPCError,
@@ -37,11 +37,7 @@ from vllm.model_executor.model_loader.weight_cache.protocol import (
     WeightCacheUnavailableError,
     check_ipc_platform_support,
     check_ipc_quant_support,
-    connect_daemon,
     get_current_device_uuid,
-    get_socket_path,
-    recv_msg,
-    send_msg,
 )
 from vllm.model_executor.model_loader.weight_cache.utils import (
     is_draft_model_cacheable,
@@ -118,6 +114,21 @@ class IpcModelLoader(BaseModelLoader):
                 f"{load_config.load_format}: {sorted(extra_config)}"
             )
 
+    def _client(self) -> ClientConnector:
+        # Resolved lazily: the connector derives the socket from the current
+        # device, which is only set once the worker is placed on its GPU.
+        connector = getattr(self, "_connector", None)
+        if connector is None:
+            connector = ClientConnector.for_local_daemon(
+                socket_path=self.socket_path,
+                socket_dir=self.socket_dir,
+                is_draft=self.is_draft,
+                connect_timeout_s=self.connect_timeout_s,
+                state_timeout_s=self.state_timeout_s,
+            )
+            self._connector = connector
+        return connector
+
     def get_external_weight_memory(self, vllm_config: VllmConfig) -> int:
         # Copy mode clones the weights into this process; nothing external.
         if self.mode != "zero_copy":
@@ -141,10 +152,10 @@ class IpcModelLoader(BaseModelLoader):
             # The loader waits for the daemon at load time, so the weights
             # will be zero-copy mapped for sure; mirror that wait here since
             # returning 0 would over-grant the memory budget.
-            return self._with_startup_wait(self._query_daemon_memory)
+            return self._with_startup_wait(self._client().get_memory)
         # An unreachable daemon means a disk load, i.e. nothing external.
         try:
-            return self._query_daemon_memory()
+            return self._client().get_memory()
         except (WeightCacheUnavailableError, ConnectionError, OSError) as e:
             logger.warning(
                 "Cannot query weight cache daemon memory (%s); "
@@ -152,17 +163,6 @@ class IpcModelLoader(BaseModelLoader):
                 e,
             )
             return 0
-
-    def _query_daemon_memory(self) -> int:
-        with self._connect(self.connect_timeout_s) as conn:
-            send_msg(conn, {"cmd": "get_memory"})
-            response = recv_msg(conn)
-        if response.get("status") != "ok":
-            raise WeightCacheUnavailableError(
-                "Weight cache daemon rejected the memory query: "
-                f"{response.get('message')}"
-            )
-        return int(response.get("memory_bytes", 0))
 
     def download_model(self, model_config: ModelConfig) -> None:
         DefaultModelLoader(self._fallback_load_config()).download_model(model_config)
@@ -394,40 +394,9 @@ class IpcModelLoader(BaseModelLoader):
                 )
 
     def _request_state(self, cache_config: WeightCacheKey) -> WeightCacheState:
-        with self._connect(self.state_timeout_s) as conn:
-            send_msg(conn, {"cmd": "get_state", "cache_config": cache_config})
-            response = recv_msg(conn)
-        status = response.get("status")
-        if status == "mismatch":
-            raise CacheConfigMismatchError(
-                f"WeightCacheKey mismatch on fields: {response.get('fields')}"
-            )
-        if status != "ok":
-            raise WeightCacheUnavailableError(
-                f"Weight cache daemon error: {response.get('message')}"
-            )
-        self._check_gpu_uuid(response.get("gpu_uuid"))
-        return WeightCacheState(
-            entries=response["entries"],
-            aliases=response.get("aliases", {}),
-            attrs=response.get("attrs", {}),
-        )
-
-    def _connect(self, timeout: float) -> socket.socket:
-        return connect_daemon(
-            self._resolve_socket_path(),
-            timeout,
-            strict_perms=self.socket_path is None and self.socket_dir is None,
-        )
-
-    def _resolve_socket_path(self) -> str:
-        if self.socket_path is not None:
-            return self.socket_path
-        return get_socket_path(
-            get_current_device_uuid(),
-            self.socket_dir,
-            is_draft=self.is_draft,
-        )
+        state = self._client().get_state(cache_config)
+        self._check_gpu_uuid(state.gpu_uuid)
+        return state
 
     def _check_gpu_uuid(self, daemon_uuid: str | None) -> None:
         if daemon_uuid is None:
@@ -440,12 +409,7 @@ class IpcModelLoader(BaseModelLoader):
             )
 
     def _send_release(self) -> None:
-        try:
-            with self._connect(self.connect_timeout_s) as conn:
-                send_msg(conn, {"cmd": "release"})
-                recv_msg(conn)
-        except (WeightCacheUnavailableError, ConnectionError, OSError):
-            logger.warning("Failed to ask the weight cache daemon to release")
+        self._client().release()
 
     def _fallback_load_config(self) -> LoadConfig:
         # DefaultModelLoader must not see load_format="ipc_cache" or the ipc
