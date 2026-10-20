@@ -186,6 +186,17 @@ class Request:
 
         # Multi-modal related
         self.mm_features = mm_features or []
+        # Furthest token position that must be covered by decoder KV because
+        # its media payload does not exist on this instance. Computed once at
+        # construction; 0 for ordinary requests.
+        self.mm_required_kv_tokens = max(
+            (
+                feature.mm_position.offset + feature.mm_position.length
+                for feature in self.mm_features
+                if feature.requires_kv
+            ),
+            default=0,
+        )
 
         # Read-only views
         # Prevent directly appending to these lists since

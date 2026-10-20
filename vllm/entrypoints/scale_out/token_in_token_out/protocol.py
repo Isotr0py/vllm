@@ -98,6 +98,29 @@ class MultiModalFeatures(BaseModel):
     `pixel_values`.
     """
 
+    requires_kv: bool = Field(default=False, exclude_if=lambda value: not value)
+    """All items require decoder KV coverage instead of encoder computation.
+
+    This is a requirement, not proof of KV availability: the scheduler checks
+    actual coverage, including after preemption and failed loads. It is valid
+    with local prefix KV and does not require a KV connector.
+    """
+
+    @model_validator(mode="after")
+    def _validate_kv_requirement(self) -> "MultiModalFeatures":
+        if not self.requires_kv:
+            return self
+        if any(
+            not hashes or any(not h for h in hashes)
+            for hashes in self.mm_hashes.values()
+        ):
+            raise ValueError("requires_kv requires a nonempty hash per item")
+        if _has_serialized_mm_items(self.kwargs_data) or _has_serialized_mm_items(
+            self.mm_metadata
+        ):
+            raise ValueError("requires_kv does not accept serialized media payloads")
+        return self
+
     @model_validator(mode="after")
     def _validate_parallel_fields(self) -> "MultiModalFeatures":
         modalities = set(self.mm_hashes)
@@ -202,6 +225,10 @@ class GenerateRequest(BaseModel):
     def _require_ec_for_metadata_only(self) -> "GenerateRequest":
         features = self.features
         if features is None:
+            return self
+        if features.requires_kv:
+            # KV coverage stands on its own: local prefix KV needs no
+            # connector, and there is no media payload to fulfill.
             return self
         if not _has_serialized_mm_items(features.mm_metadata):
             return self

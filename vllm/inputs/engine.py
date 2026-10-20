@@ -144,6 +144,10 @@ class MultiModalInput(_InputOptions):
     mm_hashes: MultiModalHashes
     """The hashes of the multi-modal data."""
 
+    mm_requires_kv: NotRequired[bool]
+    """All media computation is supplied by existing decoder KV coverage;
+    missing coverage is an error rather than a cache miss."""
+
     mm_placeholders: MultiModalPlaceholders
     """
     For each modality, information about the placeholder tokens in

@@ -655,6 +655,17 @@ class BaseRenderer(ABC, Generic[_T]):
 
         return prompt
 
+    @staticmethod
+    def _reject_kv_only_prompt(prompt: SingletonDictPrompt) -> None:
+        if prompt.get("mm_requires_kv"):  # type: ignore[typeddict-item]
+            raise VLLMValidationError(
+                "Inputs requiring existing multimodal KV coverage cannot be "
+                "rendered again: rendering would drop the KV requirement and "
+                "media identity. Submit them directly to AsyncLLM.generate() "
+                "or LLMEngine.add_request(); LLM.generate() accepts raw "
+                "prompts only."
+            )
+
     @overload
     def _tokenize_singleton_prompt(
         self,
@@ -674,6 +685,7 @@ class BaseRenderer(ABC, Generic[_T]):
         prompt: SingletonDictPrompt,
         params: TokenizeParams,
     ) -> SingletonTokPrompt:
+        self._reject_kv_only_prompt(prompt)
         if "prompt_token_ids" not in prompt and "prompt_embeds" not in prompt:
             if not isinstance(prompt.get("prompt"), str):
                 raise TypeError(
@@ -718,6 +730,7 @@ class BaseRenderer(ABC, Generic[_T]):
         prompt: SingletonDictPrompt,
         params: TokenizeParams,
     ) -> SingletonTokPrompt:
+        self._reject_kv_only_prompt(prompt)
         if "prompt_token_ids" not in prompt and "prompt_embeds" not in prompt:
             if not isinstance(prompt.get("prompt"), str):
                 raise TypeError(

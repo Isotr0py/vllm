@@ -251,6 +251,7 @@ class Scheduler(SchedulerInterface):
         # update_from_output.
         self.grammar_compile_error_reqs: set[str] = set()
         self.encoder_cache_mismatch_reqs: set[str] = set()
+        self.missing_multimodal_kv_reqs: set[str] = set()
 
         # Encoder-related.
         # Calculate encoder cache size if applicable
@@ -1895,6 +1896,20 @@ class Scheduler(SchedulerInterface):
         """
         if num_new_tokens == 0 or not request.has_encoder_inputs:
             return [], num_new_tokens, encoder_compute_budget, [], []
+        if num_computed_tokens < request.mm_required_kv_tokens:
+            # The request carries no media, so tokens below the required
+            # boundary can never be recomputed here. Fail instead of computing
+            # garbage; after preemption num_computed_tokens is re-derived from
+            # the prefix cache, so this check re-applies naturally.
+            logger.error(
+                "Request %s cannot recompute multimodal input without media; "
+                "KV covers %d tokens, requires %d. Retry through prefill.",
+                request.request_id,
+                num_computed_tokens,
+                request.mm_required_kv_tokens,
+            )
+            self.missing_multimodal_kv_reqs.add(request.request_id)
+            return [], 0, encoder_compute_budget, [], []
         encoder_inputs_to_schedule: list[int] = []
         mm_features = request.mm_features
         assert mm_features is not None
@@ -2393,6 +2408,8 @@ class Scheduler(SchedulerInterface):
         self.grammar_compile_error_reqs.clear()
         error_req_ids.update(self.encoder_cache_mismatch_reqs)
         self.encoder_cache_mismatch_reqs.clear()
+        error_req_ids.update(self.missing_multimodal_kv_reqs)
+        self.missing_multimodal_kv_reqs.clear()
         if failed_kv_load_req_ids and not self.recompute_kv_load_failures:
             error_req_ids.update(failed_kv_load_req_ids)
         if self.ec_connector is not None:
