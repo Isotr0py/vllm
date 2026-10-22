@@ -274,7 +274,7 @@ def _run_packing(
 
     runs: list[tuple[list[int], str, int]] = []
 
-    def fake_run(mm_kwargs, token_budget, path="default", axis_keys=()):
+    def fake_run(mm_kwargs, token_budget, path="default", axis_keys=(), num_items=None):
         runs.append((list(mm_kwargs["indices"]), path, token_budget))
         n_tokens = sum(
             specs[i].get_path_output_tokens(path) for i in mm_kwargs["indices"]

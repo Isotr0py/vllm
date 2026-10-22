@@ -1697,6 +1697,13 @@ class KimiK3ForConditionalGeneration(
     def get_encoder_cudagraph_config(self):
         from vllm.v1.worker.encoder_cudagraph_defs import EncoderCudaGraphConfig
 
+        def slice_copy_no_zero(dst: torch.Tensor, src: torch.Tensor) -> None:
+            # Pad rows are never read back: cu_seqlens schedules zero-length
+            # work for them, merge_gather_idx only gathers real rows, and
+            # postprocess scatters only real output tokens. Stale tails are
+            # harmless, so skip the default full-buffer zero_().
+            dst[: src.shape[0]].copy_(src)
+
         return EncoderCudaGraphConfig(
             modalities=["image"],
             buffer_keys=[
@@ -1709,6 +1716,40 @@ class KimiK3ForConditionalGeneration(
                 "merge_gather_idx",
             ],
             out_hidden_size=self.hidden_size,
+            padding_logics={
+                "pixel_values": slice_copy_no_zero,
+                "pos_embeds": slice_copy_no_zero,
+                "rope_freqs_cis": slice_copy_no_zero,
+                "cu_seqlens": slice_copy_no_zero,
+                "merge_gather_idx": slice_copy_no_zero,
+            },
+            # Denser than power-of-2: replay cost scales with the padded row
+            # count (budget x merge unit), and with 2 images/prompt the packed
+            # token sums routinely land mid-rung (e.g. 2392, 3231), where the
+            # 2x ladder wastes 40-70% linear-layer compute. 18 graphs capture
+            # in ~4s / 4.3 GiB on GB200 (vs 9 graphs / 3.4 GiB for the 2x
+            # ladder). User-provided encoder_cudagraph_token_budgets still
+            # override this list.
+            default_token_budgets=[
+                64,
+                128,
+                256,
+                384,
+                512,
+                768,
+                1024,
+                1536,
+                2048,
+                2560,
+                3072,
+                3328,
+                3584,
+                4096,
+                6144,
+                8192,
+                12288,
+                16384,
+            ],
         )
 
     def get_encoder_cudagraph_budget_range(

@@ -88,6 +88,16 @@ class EncoderCudaGraphManager:
         user_budgets = comp_config.encoder_cudagraph_token_budgets
         user_max_vision_items = comp_config.encoder_cudagraph_max_vision_items_per_batch
         user_max_frames = comp_config.encoder_cudagraph_max_frames_per_batch
+        if not user_budgets and self.config.default_token_budgets:
+            # Model-provided default ladder, clamped to the model's budget
+            # range; treated like user-specified budgets (same validation
+            # and max_batch_size inference).
+            min_b, max_b = model.get_encoder_cudagraph_budget_range(vllm_config)
+            ladder = [
+                b for b in self.config.default_token_budgets if min_b <= b <= max_b
+            ]
+            if ladder:
+                user_budgets = ladder
 
         multimodal_config = vllm_config.model_config.multimodal_config
 
@@ -406,6 +416,7 @@ class EncoderCudaGraphManager:
         token_budget: int,
         path: str = "default",
         axis_keys: CaptureAxisKeys = (),
+        num_items: int | None = None,
     ) -> torch.Tensor | None:
         """Execute budget graph.
 
@@ -414,13 +425,17 @@ class EncoderCudaGraphManager:
             token_budget: Token budget to use.
             path: Configured encoder path.
             axis_keys: Resolved capture-axis keys for this batch.
+            num_items: Number of items in the batch, for stats. When None,
+                re-derived from the model (an extra device sync); callers
+                that already know the batch size should pass it.
 
         Returns:
             Encoder outputs, or None if graph not captured.
 
         """
         graph_set = self._get_graph_set(path)
-        num_items = len(self._get_item_specs(mm_kwargs))
+        if num_items is None:
+            num_items = len(self._get_item_specs(mm_kwargs))
 
         graph_map_key: BudgetGraphMapKey = (
             token_budget if not axis_keys else (token_budget, axis_keys)
@@ -546,6 +561,7 @@ class EncoderCudaGraphManager:
                         token_budget,
                         path=path,
                         axis_keys=axis_keys,
+                        num_items=len(batch_indices),
                     )
                     assert graph_output is not None
                     output = graph_output

@@ -7,6 +7,7 @@ including 3D patch embedding, RoPE position embedding, and
 temporal pooling for video chunks.
 """
 
+from collections import OrderedDict
 from collections.abc import Sequence
 from copy import deepcopy
 from typing import Any
@@ -23,7 +24,9 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import get_act_fn
 from vllm.model_executor.layers.attention.mm_encoder_attention import MMEncoderAttention
 from vllm.model_executor.layers.conv import Conv2dLayer
+from vllm.model_executor.layers.fusion.fused_add_norm import fused_add_layer_norm
 from vllm.model_executor.layers.fusion.mm_input_norm import IdentityInputNorm
+from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
     QKVParallelLinear,
@@ -40,12 +43,43 @@ from vllm.model_executor.models.vision import (
     is_vit_use_data_parallel,
     run_dp_sharded_mrope_vision_model,
 )
-from vllm.platforms import current_platform
 from vllm.transformers_utils.configs.kimi_k3 import KimiK3VisionConfig
-from vllm.triton_utils import HAS_TRITON
+from vllm.triton_utils import HAS_TRITON, tl, triton
 from vllm.utils.torch_utils import async_tensor_h2d
 
 logger = init_logger(__name__)
+
+# LRU capacity (number of distinct (t, h, w) grids) for the per-resolution
+# device-side caches of interpolated pos_embeds / rope freqs_cis pieces.
+_RESOLUTION_CACHE_SIZE = 16
+
+
+class _ResolutionCache:
+    """Bounded LRU cache keyed by (t, h, w) holding device tensors."""
+
+    def __init__(self, capacity: int = _RESOLUTION_CACHE_SIZE):
+        self.capacity = capacity
+        self._cache: OrderedDict[tuple[int, int, int], torch.Tensor] = OrderedDict()
+
+    def get_or_compute(
+        self,
+        t: int,
+        h: int,
+        w: int,
+        compute,
+        device: torch.device | None = None,
+    ) -> torch.Tensor:
+        key = (t, h, w)
+        hit = self._cache.get(key)
+        if hit is not None and (device is None or hit.device == device):
+            self._cache.move_to_end(key)
+            return hit
+        value = compute()
+        self._cache[key] = value
+        self._cache.move_to_end(key)
+        while len(self._cache) > self.capacity:
+            self._cache.popitem(last=False)
+        return value
 
 
 def _get_pos_emb_size(
@@ -63,26 +97,7 @@ def _apply_rope_input_validation(x, freqs_cis):
     assert freqs_cis.dtype == torch.complex64, freqs_cis.dtype
 
 
-def get_rope_shape_decorate(func):
-    _get_rope_shape_first_call_flag = set()
-
-    def wrapper(org, interpolation_mode, shape):
-        key = (org.requires_grad, torch.is_grad_enabled(), interpolation_mode)
-        if key not in _get_rope_shape_first_call_flag:
-            _get_rope_shape_first_call_flag.add(key)
-            _ = func(org, interpolation_mode, shape=(64, 64))
-        return func(org, interpolation_mode, shape)
-
-    return wrapper
-
-
-@get_rope_shape_decorate
-@torch.compile(
-    dynamic=True,
-    backend=current_platform.simple_compile_backend,
-    disable=current_platform.simple_compile_backend == "tpu",
-)
-def get_rope_shape(org, interpolation_mode, shape):
+def _interp_pos_embed_2d_eager(org, interpolation_mode, shape):
     return (
         F.interpolate(
             org.permute((2, 0, 1)).unsqueeze(0),
@@ -93,6 +108,150 @@ def get_rope_shape(org, interpolation_mode, shape):
         .permute((1, 2, 0))
         .flatten(end_dim=1)
     )
+
+
+if HAS_TRITON:
+    # h_out/w_out are not specialized: image resolutions vary per request, and
+    # a recompile must never trigger inside encoder CUDA graph capture. All
+    # remaining specialization keys (H_IN/W_IN/D/BLOCK_D/BICUBIC, dtype) are
+    # fixed per model, so the first eager call compiles every variant the
+    # graph will ever launch.
+    @triton.jit(do_not_specialize=["h_out", "w_out"])
+    def _pos_embed_interp_2d_kernel(
+        weight_ptr,  # (H_IN, W_IN, D)
+        out_ptr,  # (h_out * w_out, D)
+        h_out,
+        w_out,
+        h_scale,
+        w_scale,
+        H_IN: tl.constexpr,
+        W_IN: tl.constexpr,
+        D: tl.constexpr,
+        BLOCK_D: tl.constexpr,
+        BICUBIC: tl.constexpr,
+    ):
+        # Matches ATen F.interpolate (align_corners=False, antialias=False)
+        # for a (1, D, H_IN, W_IN) input viewed as (H_IN, W_IN, D).
+        pid = tl.program_id(0)
+        row = pid // w_out
+        col = pid % w_out
+
+        src_r = (row.to(tl.float32) + 0.5) * h_scale - 0.5
+        src_c = (col.to(tl.float32) + 0.5) * w_scale - 0.5
+
+        if BICUBIC:
+            # Cubic convolution with A = -0.75; source coords may go
+            # negative, neighbor indices are clamped (replicate padding).
+            A: tl.constexpr = -0.75
+            tr = src_r - tl.math.floor(src_r)
+            tc = src_c - tl.math.floor(src_c)
+            ks = tl.arange(0, 4)
+            r_idx = tl.minimum(
+                tl.maximum(tl.math.floor(src_r).to(tl.int32) - 1 + ks, 0), H_IN - 1
+            )
+            c_idx = tl.minimum(
+                tl.maximum(tl.math.floor(src_c).to(tl.int32) - 1 + ks, 0), W_IN - 1
+            )
+            t_r = tl.where(ks == 0, tr + 1.0, tl.where(ks == 1, tr, 1.0 - tr))
+            t_r = tl.where(ks == 3, 2.0 - tr, t_r)
+            conv1 = ((A + 2) * t_r - (A + 3)) * t_r * t_r + 1.0
+            conv2 = ((A * t_r - 5 * A) * t_r + 8 * A) * t_r - 4 * A
+            w_r = tl.where((ks == 0) | (ks == 3), conv2, conv1)  # (4,)
+            t_c = tl.where(ks == 0, tc + 1.0, tl.where(ks == 1, tc, 1.0 - tc))
+            t_c = tl.where(ks == 3, 2.0 - tc, t_c)
+            conv1 = ((A + 2) * t_c - (A + 3)) * t_c * t_c + 1.0
+            conv2 = ((A * t_c - 5 * A) * t_c + 8 * A) * t_c - 4 * A
+            w_c = tl.where((ks == 0) | (ks == 3), conv2, conv1)  # (4,)
+        else:
+            src_r = tl.maximum(src_r, 0.0)
+            src_c = tl.maximum(src_c, 0.0)
+            r0f = tl.math.floor(src_r)
+            c0f = tl.math.floor(src_c)
+            fr = src_r - r0f
+            fc = src_c - c0f
+            r0 = r0f.to(tl.int32)
+            c0 = c0f.to(tl.int32)
+            r1 = tl.minimum(r0 + 1, H_IN - 1)
+            c1 = tl.minimum(c0 + 1, W_IN - 1)
+
+        for d in tl.range(0, D, BLOCK_D):
+            cols = d + tl.arange(0, BLOCK_D)
+            mask = cols < D
+            if BICUBIC:
+                offs = (r_idx[:, None, None] * W_IN + c_idx[None, :, None]) * D + cols[
+                    None, None, :
+                ]
+                v = tl.load(weight_ptr + offs, mask=mask[None, None, :], other=0.0).to(
+                    tl.float32
+                )  # (4, 4, BLOCK_D)
+                val = tl.sum(
+                    tl.sum(v * w_c[None, :, None], axis=1) * w_r[:, None],
+                    axis=0,
+                )
+            else:
+                v00 = tl.load(
+                    weight_ptr + (r0 * W_IN + c0) * D + cols, mask=mask, other=0.0
+                ).to(tl.float32)
+                v01 = tl.load(
+                    weight_ptr + (r0 * W_IN + c1) * D + cols, mask=mask, other=0.0
+                ).to(tl.float32)
+                v10 = tl.load(
+                    weight_ptr + (r1 * W_IN + c0) * D + cols, mask=mask, other=0.0
+                ).to(tl.float32)
+                v11 = tl.load(
+                    weight_ptr + (r1 * W_IN + c1) * D + cols, mask=mask, other=0.0
+                ).to(tl.float32)
+                val = (1 - fr) * ((1 - fc) * v00 + fc * v01) + fr * (
+                    (1 - fc) * v10 + fc * v11
+                )
+            tl.store(
+                out_ptr + pid * D + cols,
+                val.to(out_ptr.dtype.element_ty),
+                mask=mask,
+            )
+
+    def _pos_embed_interp_2d(
+        weight: torch.Tensor, shape: tuple[int, int], mode: str
+    ) -> torch.Tensor:
+        """Bilinear/bicubic 2D interpolation of (H, W, D) position embeddings.
+
+        Returns a contiguous (h * w, D) tensor, equivalent to the eager
+        F.interpolate chain in ``_interp_pos_embed_2d_eager``.
+        """
+        h_in, w_in, dim = weight.shape
+        h_out, w_out = shape
+        assert weight.is_contiguous(), "pos-emb weight must be contiguous"
+        out = torch.empty(h_out * w_out, dim, device=weight.device, dtype=weight.dtype)
+        # fp32 division, matching ATen's accscalar_t scale computation.
+        h_scale = float(np.float32(h_in) / np.float32(h_out))
+        w_scale = float(np.float32(w_in) / np.float32(w_out))
+        BLOCK_D = 256
+        _pos_embed_interp_2d_kernel[(h_out * w_out,)](
+            weight,
+            out,
+            h_out,
+            w_out,
+            h_scale,
+            w_scale,
+            H_IN=h_in,
+            W_IN=w_in,
+            D=dim,
+            BLOCK_D=BLOCK_D,
+            BICUBIC=mode == "bicubic",
+            num_warps=4,
+        )
+        return out
+
+
+def get_rope_shape(org, interpolation_mode, shape):
+    if (
+        HAS_TRITON
+        and interpolation_mode in ("bilinear", "bicubic")
+        and org.is_cuda
+        and not torch.is_grad_enabled()
+    ):
+        return _pos_embed_interp_2d(org, shape, interpolation_mode)
+    return _interp_pos_embed_2d_eager(org, interpolation_mode, shape)
 
 
 def get_1d_sincos_pos_embed_from_grid(embed_dim, pos):
@@ -148,33 +307,43 @@ class Learnable2DInterpPosEmbDivided_fixed(nn.Module):
         )
 
         self.reset_parameters()
+        self._pos_embed_cache = _ResolutionCache()
 
     def reset_parameters(self):
         nn.init.normal_(self.weight)
 
+    def _compute_pos_embed_3d(self, t: int, h: int, w: int) -> torch.Tensor:
+        assert t <= self.num_frames, f"t:{t} > self.num_frames:{self.num_frames}"
+        if (h, w) == self.weight.shape[:-1]:
+            pos_emb_2d = self.weight.flatten(end_dim=1)
+        else:
+            pos_emb_2d = get_rope_shape(
+                self.weight,
+                interpolation_mode=self.interpolation_mode,
+                shape=(h, w),
+            )
+
+        if t == 1:
+            pos_emb_3d = pos_emb_2d
+        else:
+            pos_emb_3d = pos_emb_2d.unsqueeze(0).repeat(t, 1, 1) + self.time_weight[0:t]
+
+        return pos_emb_3d.reshape(-1, pos_emb_3d.shape[-1])
+
     def get_pos_embeds(self, grid_thws: torch.Tensor | list[list[int]]) -> torch.Tensor:
-        pos_embs = []
         grid_thw_list = grid_thws if isinstance(grid_thws, list) else grid_thws.tolist()
-        for t, h, w in grid_thw_list:
-            assert t <= self.num_frames, f"t:{t} > self.num_frames:{self.num_frames}"
-            if (h, w) == self.weight.shape[:-1]:
-                pos_emb_2d = self.weight.flatten(end_dim=1)
-            else:
-                pos_emb_2d = get_rope_shape(
-                    self.weight,
-                    interpolation_mode=self.interpolation_mode,
-                    shape=(h, w),
-                )
-
-            if t == 1:
-                pos_emb_3d = pos_emb_2d
-            else:
-                pos_emb_3d = (
-                    pos_emb_2d.unsqueeze(0).repeat(t, 1, 1) + self.time_weight[0:t]
-                )
-
-            pos_embs.append(pos_emb_3d.reshape(-1, pos_emb_3d.shape[-1]))
-
+        pos_embs = [
+            self._pos_embed_cache.get_or_compute(
+                t,
+                h,
+                w,
+                lambda t=t, h=h, w=w: self._compute_pos_embed_3d(t, h, w),
+                device=self.weight.device,
+            )
+            for t, h, w in grid_thw_list
+        ]
+        if len(pos_embs) == 1:
+            return pos_embs[0]
         return torch.cat(pos_embs)
 
     def forward(
@@ -308,14 +477,23 @@ class Rope2DPosEmbRepeated(nn.Module):
             self.max_height,
             self.max_width,
         )
-        freqs_cis = torch.cat(
-            [
-                self.freqs_cis[:h, :w].reshape(-1, self.dim // 2).repeat(t, 1)
-                for t, h, w in shapes
-            ],
-            dim=0,
-        )
-        return freqs_cis
+        if not hasattr(self, "_freqs_cis_cache"):
+            self._freqs_cis_cache = _ResolutionCache()
+        pieces = [
+            self._freqs_cis_cache.get_or_compute(
+                t,
+                h,
+                w,
+                lambda t=t, h=h, w=w: (
+                    self.freqs_cis[:h, :w].reshape(-1, self.dim // 2).repeat(t, 1)
+                ),
+                device=self.freqs_cis.device,
+            )
+            for t, h, w in shapes
+        ]
+        if len(pieces) == 1:
+            return pieces[0]
+        return torch.cat(pieces, dim=0)
 
 
 class MLP2(nn.Module):
@@ -362,7 +540,11 @@ def _make_vision_norm(norm_type: str, hidden_dim: int) -> nn.Module:
     if norm_type == "layernorm":
         return nn.LayerNorm(hidden_dim)
     if norm_type == "rmsnorm":
-        return nn.RMSNorm(hidden_dim)
+        # vLLM's RMSNorm custom op, which fuses the residual add via
+        # forward(x, residual). Same state_dict (weight only) and numerics
+        # as nn.RMSNorm(hidden_dim): eps=None resolves to finfo(float32).eps
+        # regardless of input dtype, and both accumulate in fp32.
+        return RMSNorm(hidden_dim, eps=torch.finfo(torch.float32).eps)
     raise NotImplementedError(f"Not support norm_type: {norm_type}")
 
 
@@ -400,6 +582,7 @@ class MoonViTEncoderLayer(nn.Module):
 
         self.norm0 = _make_vision_norm(norm_type, hidden_dim)
         self.norm1 = _make_vision_norm(norm_type, hidden_dim)
+        self.norm_type = norm_type
         if mlp_type != "mlp2":
             raise NotImplementedError(f"Not support mlp_type: {mlp_type}")
         self.mlp = MLP2(
@@ -518,14 +701,23 @@ class MoonViTEncoderLayer(nn.Module):
             max_seqlen=max_seqlen,
             sequence_lengths=sequence_lengths,
         )
-        hidden_states = residual + hidden_states
+        if self.norm_type == "rmsnorm":
+            # Fused residual add + RMSNorm via the RMSNorm custom op.
+            normed, hidden_states = self.norm1(hidden_states, residual)
+        elif HAS_TRITON and hidden_states.is_cuda:
+            assert isinstance(self.norm1, nn.LayerNorm)
+            normed, hidden_states = fused_add_layer_norm(
+                hidden_states,
+                residual,
+                self.norm1.weight,
+                self.norm1.bias,
+                self.norm1.eps,
+            )
+        else:
+            hidden_states = residual + hidden_states
+            normed = self.norm1(hidden_states)
 
-        residual = hidden_states
-        hidden_states = self.norm1(hidden_states)
-        hidden_states = self.mlp(hidden_states)
-        hidden_states = residual + hidden_states
-
-        return hidden_states
+        return hidden_states + self.mlp(normed)
 
 
 class MoonViT3dEncoder(nn.Module):
@@ -678,6 +870,19 @@ def tpool_patch_merger(
     return outputs
 
 
+def _build_merge_gather_idx_part(h: int, w: int, kh: int, kw: int) -> np.ndarray:
+    """Spatial-merge indices for one (1, h, w) image, offset 0."""
+    idx = np.arange(h * w, dtype=np.int64).reshape(h, w)
+    idx = idx.reshape(h // kh, kh, w // kw, kw)
+    return idx.transpose(0, 2, 1, 3).reshape(-1, kh * kw)
+
+
+_merge_gather_idx_part_cache: OrderedDict[tuple[int, int, int, int], np.ndarray] = (
+    OrderedDict()
+)
+_MERGE_IDX_PART_CACHE_SIZE = 64
+
+
 def build_image_merge_gather_idx(
     grid_thws: list[list[int]] | list[tuple[int, int, int]],
     merge_kernel_size: tuple[int, int],
@@ -689,9 +894,15 @@ def build_image_merge_gather_idx(
     for t, h, w in grid_thws:
         if t != 1:
             raise ValueError("Image encoder CUDA graphs require grid T == 1")
-        idx = np.arange(h * w, dtype=np.int64).reshape(h, w)
-        idx = idx.reshape(h // kh, kh, w // kw, kw)
-        parts.append(idx.transpose(0, 2, 1, 3).reshape(-1, kh * kw) + offset)
+        key = (h, w, kh, kw)
+        part = _merge_gather_idx_part_cache.get(key)
+        if part is None:
+            part = _build_merge_gather_idx_part(h, w, kh, kw)
+            _merge_gather_idx_part_cache[key] = part
+            _merge_gather_idx_part_cache.move_to_end(key)
+            while len(_merge_gather_idx_part_cache) > _MERGE_IDX_PART_CACHE_SIZE:
+                _merge_gather_idx_part_cache.popitem(last=False)
+        parts.append(part + offset if offset else part)
         offset += h * w
     if not parts:
         return np.empty((0, kh * kw), dtype=np.int64)

@@ -89,6 +89,16 @@ class EncoderCudaGraphConfig:
     Only relevant when "video" is in ``modalities``.
     Image-only models can use the default of 1."""
 
+    default_token_budgets: list[int] | None = None
+    """Model-provided default token-budget ladder.
+
+    Used only when the user has not set
+    ``CompilationConfig.encoder_cudagraph_token_budgets``. When None, the
+    manager generates a power-of-2 ladder from the model's budget range
+    (unchanged legacy behavior). Models with high padding sensitivity can
+    ship a denser default ladder here.
+    """
+
     paths: dict[str, EncoderCudaGraphPathConfig] = field(
         default_factory=lambda: {"default": EncoderCudaGraphPathConfig()}
     )
