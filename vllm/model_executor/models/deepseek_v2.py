@@ -1284,7 +1284,14 @@ class DeepseekV2DecoderLayer(nn.Module):
         self.use_mha = use_mha
 
         attn_cls: typing.Any
-        if use_mha:
+        if use_mha and getattr(config, "sparse_attention_config", None) is not None:
+            # Unlimited-OCR-2: DASH SR-SWA attention replaces the plain MHA.
+            from vllm.model_executor.models.unlimited_ocr2.attention import (
+                UnlimitedOCR2Attention,
+            )
+
+            attn_cls = UnlimitedOCR2Attention
+        elif use_mha:
             attn_cls = DeepseekAttention
         elif model_config.use_mla:
             attn_cls = DeepseekV2MLAAttention
@@ -1658,6 +1665,18 @@ class DeepseekV2Model(nn.Module):
                 name.rsplit(".indexer.", 1)[0] not in indexer_present_prefixes
             ):
                 continue  # this layer has no indexer; drop its checkpoint weights
+
+            # DASH (Unlimited-OCR-2) router/indexer weights load 1:1 by name;
+            # they must not hit the qkv/gate_up stacking below ("q_proj" etc.
+            # are substrings of the stacked-mapping shard names).
+            if (".dash_router." in name or ".indexer." in name) and (
+                name in params_dict
+            ):
+                if is_pp_missing_parameter(name, self):
+                    continue
+                default_weight_loader(params_dict[name], loaded_weight)
+                loaded_params.add(name)
+                continue
 
             is_fusion_moe_shared_experts_layer = (
                 self.is_fused_shared_expert_enabled and ("mlp.shared_experts" in name)

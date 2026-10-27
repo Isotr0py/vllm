@@ -23,10 +23,13 @@ from vllm.model_executor.layers.attention import MMEncoderAttention
 from vllm.model_executor.layers.conv import Conv2dLayer
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.platforms import current_platform
-from vllm.triton_utils import LOG2E, tl, triton
+from vllm.triton_utils import tl, triton
 
 from .clip import CLIPEncoder, CLIPVisionEmbeddings
 from .utils import AutoWeightsLoader
+
+# Triton @jit bodies can only read module globals that are tl.constexpr.
+_LOG2E = tl.constexpr(1.4426950408889634)
 
 
 @triton.jit
@@ -90,7 +93,7 @@ def _deepencoder_rel_pos_attention_kernel(
     row_max = tl.full([BLOCK_M], -float("inf"), tl.float32)
     row_sum = tl.zeros([BLOCK_M], tl.float32)
     accumulator = tl.zeros([BLOCK_M, BLOCK_D], tl.float32)
-    qk_scale = scale * LOG2E
+    qk_scale = scale * _LOG2E
 
     for start_n in range(0, num_tokens, BLOCK_N):
         key_indices = start_n + offs_n
@@ -121,7 +124,7 @@ def _deepencoder_rel_pos_attention_kernel(
         score_mask = mask_m[:, None] & mask_n[None, :]
         rel_h = tl.load(rel_h_ptr + rel_h_offsets, mask=score_mask, other=0.0)
         rel_w = tl.load(rel_w_ptr + rel_w_offsets, mask=score_mask, other=0.0)
-        scores += (rel_h + rel_w) * LOG2E
+        scores += (rel_h + rel_w) * _LOG2E
         scores = tl.where(score_mask, scores, -float("inf"))
 
         next_max = tl.maximum(row_max, tl.max(scores, axis=1))

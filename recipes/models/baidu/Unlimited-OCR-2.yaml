@@ -1,0 +1,137 @@
+meta:
+  title: "Unlimited-OCR-2"
+  slug: "unlimited-ocr-2"
+  provider: "Ernie (Baidu)"
+  description: "Baidu's second-generation document-parsing model with SR-SWA sparse attention (DASH router + page2d RoPE), built for unlimited-horizon multi-page OCR."
+  date_added: 2026-10-27
+  date_updated: 2026-10-27
+  tasks:
+    - multimodal
+  performance_headline: "Unlimited-horizon multi-page document parsing to markdown"
+  related_recipes:
+    - "baidu/Unlimited-OCR"
+    - "deepseek-ai/DeepSeek-OCR"
+
+model:
+  model_id: "baidu/Unlimited-OCR-2"
+  min_vllm_version: "0.25.0"
+  install:
+    pip:
+      note: "Unlimited-OCR-2 (UnlimitedOCRForCausalLM with sparse_attention_config) is supported by the same architecture as Unlimited-OCR; the generation is detected from the checkpoint config."
+  architecture: moe
+  parameter_count: "3B"
+  active_parameters: "3B"
+  context_length: 131072
+  base_args:
+    - "--trust-remote-code"
+    - "--logits_processors"
+    - "vllm.model_executor.models.unlimited_ocr:NGramV2LogitsProcessor"
+    - "--logits_processors"
+    - "vllm.model_executor.models.unlimited_ocr_page_guard:PageCountGuardV2LogitsProcessor"
+    - "--no-enable-prefix-caching"
+    - "--mm-processor-cache-gb"
+    - "0"
+  base_env: {}
+
+features:
+  encoder_parallel:
+    description: "Run the vision encoder in data-parallel mode — avoids TP comm overhead on the small encoder."
+    args:
+      - "--mm-encoder-tp-mode"
+      - "data"
+
+opt_in_features:
+  - encoder_parallel
+
+variants:
+  default:
+    precision: bf16
+    vram_minimum_gb: 16
+    description: "Full precision BF16 (~3B params)"
+
+compatible_strategies:
+  - single_node_tp
+
+hardware_overrides: {}
+
+strategy_overrides: {}
+
+guide: |
+  ## Overview
+
+  [Unlimited-OCR-2](https://huggingface.co/baidu/Unlimited-OCR-2) is Baidu's
+  second-generation OCR model. It keeps the DeepSeek-OCR *gundam* vision stack
+  of Unlimited-OCR but replaces R-SWA with **SR-SWA**: a DASH router scores
+  32-token blocks per layer with a learned `head_cls` summary, selects a
+  top-K read set under a page-aware (same-page image block) candidate
+  constraint, and attends it together with a 128-token local window. A
+  two-axis page2d RoPE (intra-page offset + page parity) keeps text-to-image
+  attention local to its own page, which is what makes horizon scale with the
+  page count.
+
+  ## Prerequisites
+
+  - **Hardware**: a single GPU with >=16 GB VRAM.
+  - **Model runner**: Unlimited-OCR-2 requires the V2 model runner (default);
+    it currently runs eager (`enforce_eager` is enabled automatically).
+
+  ## Serving recipe (required)
+
+  Multi-page requests use the trained layout `"<PAGE><image>" * n_pages +
+  "Multi page parsing."` — the prompt text should carry one `<PAGE><image>`
+  pair per page image (the same layout the reference `infer()` builds). The two
+  request-level logits processors reproduce the reference decode recipe:
+
+  - `PageCountGuardV2LogitsProcessor` forces exactly one `<PAGE>` section
+    per prompt page (masks EOS early, forces EOS after the last page);
+  - `NGramV2LogitsProcessor` suppresses coordinate-token loops
+    (`ngram_size=35`, `window_size=128`).
+
+  ```bash
+  vllm serve baidu/Unlimited-OCR-2 \
+    --trust-remote-code \
+    --logits_processors vllm.model_executor.models.unlimited_ocr:NGramV2LogitsProcessor \
+    --logits_processors vllm.model_executor.models.unlimited_ocr_page_guard:PageCountGuardV2LogitsProcessor \
+    --no-enable-prefix-caching \
+    --mm-processor-cache-gb 0
+  ```
+
+  ```python
+  from openai import OpenAI
+
+  client = OpenAI(api_key="EMPTY", base_url="http://localhost:8000/v1", timeout=3600)
+  response = client.chat.completions.create(
+      model="baidu/Unlimited-OCR-2",
+      messages=[
+          {
+              "role": "user",
+              "content": [
+                  {"type": "text", "text": "<PAGE><image><PAGE><image>Multi page parsing."},
+                  {"type": "image_url", "image_url": {"url": "https://example.org/page1.png"}},
+                  {"type": "image_url", "image_url": {"url": "https://example.org/page2.png"}},
+              ],
+          }
+      ],
+      max_tokens=8192,
+      temperature=0.0,
+      extra_body={
+          "skip_special_tokens": False,
+          "vllm_xargs": {"ngram_size": 35, "window_size": 128},
+      },
+  )
+  print(response.choices[0].message.content)
+  ```
+
+  ## Troubleshooting / Configuration Tips
+
+  - The output should contain exactly one `<PAGE>` marker per input page;
+    if pages are missing or loop, check that `PageCountGuard` is registered.
+  - Single-image input keeps the v1 behavior (gundam crop mode); multi-image
+    requests are encoded per page in base (non-crop) mode, 273 image tokens
+    per page.
+  - Speculative decoding is not supported by the DASH decode state machine.
+
+  ## References
+
+  - [Unlimited-OCR-2 on Hugging Face](https://huggingface.co/baidu/Unlimited-OCR-2)
+  - [Unlimited OCR Works 2 paper](https://huggingface.co/baidu/Unlimited-OCR-2/blob/main/Unlimited-OCR-2.pdf)

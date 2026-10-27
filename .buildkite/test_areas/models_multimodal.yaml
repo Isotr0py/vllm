@@ -101,6 +101,7 @@ steps:
   device: cpu-medium
   commands:
     - pytest -v -s models/multimodal/processing --ignore models/multimodal/processing/test_tensor_schema.py --num-shards=$$BUILDKITE_PARALLEL_JOB_COUNT --shard-id=$$BUILDKITE_PARALLEL_JOB
+    - pytest -v -s models/unlimited_ocr2
   parallelism: 4
 
 - label: ":nvidia: (H200 MIG 18GB) Multimodal Processor"

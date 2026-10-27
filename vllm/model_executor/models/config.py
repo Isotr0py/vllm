@@ -159,6 +159,77 @@ class Gemma3TextModelConfig(VerifyAndUpdateConfig):
 
 class UnlimitedOCRForCausalLMConfig(VerifyAndUpdateConfig):
     @staticmethod
+    def _verify_and_update_config_v2(vllm_config: "VllmConfig") -> None:
+        """Configure Unlimited-OCR-2 (DASH SR-SWA).
+
+        The DASH layers drive their own block-sparse Triton kernels and read
+        only ``CommonAttentionMetadata``, so the stock LM attention backend is
+        never executed; ``--attention-config backend`` is still honoured for
+        any non-DASH consumer but defaults to Triton. The vision encoder
+        setup is identical to v1.
+        """
+        from vllm.v1.attention.backends.registry import AttentionBackendEnum
+
+        attn_config = vllm_config.attention_config
+        if attn_config.backend is None:
+            attn_config.backend = AttentionBackendEnum.TRITON_ATTN
+            logger.info(
+                "Unlimited-OCR-2: DASH layers run their own sparse kernels; "
+                "defaulting the (unused) LM attention backend to TRITON_ATTN."
+            )
+
+        # The DASH decode state machine advances one token per step.
+        if vllm_config.speculative_config is not None:
+            raise ValueError("Unlimited-OCR-2 does not support speculative decoding.")
+        # The page2d rope state machine lives in the V2 model runner.
+        if not vllm_config.use_v2_model_runner:
+            raise ValueError(
+                "Unlimited-OCR-2 requires the V2 model runner (remove "
+                "VLLM_USE_V2_MODEL_RUNNER=0)."
+            )
+
+        cache_config = vllm_config.cache_config
+        # One DASH sparse block (32 tokens) must cover exactly one KV page.
+        if cache_config.block_size != 32:
+            logger.info(
+                "Unlimited-OCR-2: setting KV cache block_size=32 (DASH sparse "
+                "block size); was %s.",
+                cache_config.block_size,
+            )
+            cache_config.block_size = 32
+        # DASH keeps full KV (no eviction), but its per-layer fp32 index
+        # cache makes reuse semantics subtle; OCR prompts rarely share
+        # prefixes anyway.
+        if cache_config.enable_prefix_caching:
+            cache_config.enable_prefix_caching = False
+            logger.info(
+                "Unlimited-OCR-2: disabling prefix caching (single-turn "
+                "image-led prompts rarely hit the prefix cache)."
+            )
+
+        # TODO(dash): the DASH forward does per-request host work; run eager
+        # until the CUDA-graph path lands.
+        model_config = vllm_config.model_config
+        if not model_config.enforce_eager:
+            logger.info(
+                "Unlimited-OCR-2: enabling enforce_eager (DASH CUDA-graph "
+                "support is not implemented yet)."
+            )
+            model_config.enforce_eager = True
+
+        mm_config = getattr(model_config, "multimodal_config", None)
+        if mm_config is not None:
+            if mm_config.mm_encoder_attn_backend is None:
+                mm_config.mm_encoder_attn_backend = AttentionBackendEnum.FLASH_ATTN
+            elif mm_config.mm_encoder_attn_backend == AttentionBackendEnum.FLASHINFER:
+                logger.warning(
+                    "Unlimited-OCR-2: FlashInfer is not supported for the "
+                    "vision encoder (the CLIP stage runs full attention "
+                    "without cu_seqlens); falling back to FlashAttention."
+                )
+                mm_config.mm_encoder_attn_backend = AttentionBackendEnum.FLASH_ATTN
+
+    @staticmethod
     def verify_and_update_config(vllm_config: "VllmConfig") -> None:
         """Configure Unlimited-OCR attention backends for R-SWA and vision.
 
@@ -192,6 +263,14 @@ class UnlimitedOCRForCausalLMConfig(VerifyAndUpdateConfig):
         """
         from vllm.v1.attention.backends.fa_utils import is_fa_version_supported
         from vllm.v1.attention.backends.registry import AttentionBackendEnum
+
+        if (
+            getattr(vllm_config.model_config.hf_config, "sparse_attention_config", None)
+            is not None
+        ):
+            # Unlimited-OCR-2: DASH SR-SWA replaces R-SWA entirely.
+            UnlimitedOCRForCausalLMConfig._verify_and_update_config_v2(vllm_config)
+            return
 
         attn_config = vllm_config.attention_config
         fa4_available = is_fa_version_supported(4)
@@ -289,6 +368,12 @@ class UnlimitedOCRForCausalLMConfig(VerifyAndUpdateConfig):
     def verify_and_update_model_config(model_config: "ModelConfig") -> None:
         text_config = model_config.hf_config.text_config
         text_config.architectures = ["DeepseekV2ForCausalLM"]
+        sparse_config = getattr(model_config.hf_config, "sparse_attention_config", None)
+        if sparse_config is not None:
+            # Unlimited-OCR-2: the DASH attention layers read the sparse
+            # config from the language model config; no R-SWA.
+            text_config.sparse_attention_config = sparse_config
+            return
         if getattr(model_config.hf_config, "rswa_window", None) is None:
             model_config.hf_config.rswa_window = 128
         # Propagate rswa_window to text_config so that DeepseekAttention (which

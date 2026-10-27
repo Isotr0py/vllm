@@ -894,6 +894,7 @@ _MULTIMODAL_EXAMPLE_MODELS = {
     ),
     "UnlimitedOCRForCausalLM": _HfExamplesInfo(
         "baidu/Unlimited-OCR",
+        extras={"v2": "baidu/Unlimited-OCR-2"},
     ),
     "DotsOCRForCausalLM": _HfExamplesInfo(
         "rednote-hilab/dots.ocr", trust_remote_code=True

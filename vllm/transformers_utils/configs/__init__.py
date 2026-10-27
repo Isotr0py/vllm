@@ -68,6 +68,9 @@ _CLASS_TO_MODULE: dict[str, str] = {
     "SpeculatorsConfig": "vllm.transformers_utils.configs.speculators",
     "UltravoxConfig": "vllm.transformers_utils.configs.ultravox",
     "UnlimitedOCRConfig": "vllm.transformers_utils.configs.unlimited_ocr",
+    "UnlimitedOCRSparseAttentionConfig": (
+        "vllm.transformers_utils.configs.unlimited_ocr"
+    ),
     "Step3VLConfig": "vllm.transformers_utils.configs.step3_vl",
     "Step3VisionEncoderConfig": "vllm.transformers_utils.configs.step3_vl",
     "Step3TextConfig": "vllm.transformers_utils.configs.step3_vl",
@@ -139,6 +142,7 @@ __all__ = [
     "SpeculatorsConfig",
     "UltravoxConfig",
     "UnlimitedOCRConfig",
+    "UnlimitedOCRSparseAttentionConfig",
     "Step3VLConfig",
     "Step3VisionEncoderConfig",
     "Step3TextConfig",
