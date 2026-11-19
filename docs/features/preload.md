@@ -335,9 +335,10 @@ Socket paths are derived from the GPU UUID, so they are stable regardless of
   and engine. Engines reuse the processed weights and scales, including
   fused-projection scales and output padding. This does not enable ModelOpt
   block FP8, FP8 MoE, or other FP8 linear backends.
-  ModelOpt NVFP4 MoE supports the TRT-LLM and vLLM CUTLASS backends. With
-  CUTLASS, the daemon fuses activation scales once; engines reuse the fused
-  scales without modifying the daemon's shared tensors.
+  ModelOpt and compressed-tensors NVFP4 MoE support the TRT-LLM and vLLM
+  CUTLASS backends. This includes MiniMax-M3.1-Flash with its default TRT-LLM
+  backend. With CUTLASS, the daemon fuses activation scales once; engines reuse
+  the fused scales without modifying the daemon's shared tensors.
 - **Consistency**: the daemon and engine must run the same vLLM version and
   agree on model, dtype, quantization, and TP/DP layout, otherwise the
   fingerprint mismatch triggers the disk fallback.

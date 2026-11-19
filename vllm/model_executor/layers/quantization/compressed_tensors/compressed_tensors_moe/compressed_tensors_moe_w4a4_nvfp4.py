@@ -40,10 +40,17 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     kNvfp4Static,
 )
 from vllm.model_executor.utils import (
+    is_weights_pre_processed,
     move_parameter,
-    refill_derived,
     replace_parameter,
     set_weight_attrs,
+)
+
+_PRE_PROCESSED_SUPPORTED_NVFP4_BACKENDS = frozenset(
+    {
+        NvFp4MoeBackend.FLASHINFER_TRTLLM,
+        NvFp4MoeBackend.VLLM_CUTLASS,
+    }
 )
 
 # NVFP4 backends that have been verified to support EPLB for this quantization recipe.
@@ -87,6 +94,10 @@ class CompressedTensorsW4A4Nvfp4MoEMethod(CompressedTensorsMoEMethod):
         self.use_global_sf = is_global_sf_supported_for_nvfp4_backend(
             self.nvfp4_backend
         )
+
+    @property
+    def supports_pre_processed_weights(self) -> bool:  # type: ignore[override]
+        return self.nvfp4_backend in _PRE_PROCESSED_SUPPORTED_NVFP4_BACKENDS
 
     @property
     def supports_eplb(self) -> bool:
@@ -225,6 +236,16 @@ class CompressedTensorsW4A4Nvfp4MoEMethod(CompressedTensorsMoEMethod):
 
     def process_weights_after_loading(self, layer: RoutedExperts) -> None:
         """Convert NVFP4 MoE weights into kernel format and setup the kernel."""
+        if is_weights_pre_processed():
+            if self.nvfp4_backend not in _PRE_PROCESSED_SUPPORTED_NVFP4_BACKENDS:
+                raise RuntimeError(
+                    "pre-processed weights require FLASHINFER_TRTLLM or "
+                    f"VLLM_CUTLASS MoE backend, got {self.nvfp4_backend}"
+                )
+            self._restore_padded_moe_dims(layer)
+            self._build_moe_kernel(layer)
+            return
+
         # MKM requires wN_weight; the loaded wN_weight_packed params stay registered.
         move_parameter(layer, "w13_weight_packed", "w13_weight")
         move_parameter(layer, "w2_weight_packed", "w2_weight")
@@ -282,10 +303,11 @@ class CompressedTensorsW4A4Nvfp4MoEMethod(CompressedTensorsMoEMethod):
         replace_parameter(layer, "w2_weight_scale", w2_scale)
         replace_parameter(layer, "w13_weight_scale_2", w13_scale_2)
         replace_parameter(layer, "w2_weight_scale_2", w2_scale_2)
-        refill_derived(layer, "w13_input_scale", a13_scale)
-        refill_derived(layer, "w2_input_scale", a2_scale)
+        replace_parameter(layer, "w13_input_scale", a13_scale)
+        replace_parameter(layer, "w2_input_scale", a2_scale)
+        self._build_moe_kernel(layer)
 
-        # Setup modular kernel.
+    def _build_moe_kernel(self, layer: RoutedExperts) -> None:
         self.moe_quant_config = self.get_fused_moe_quant_config(layer)
         assert self.experts_cls is not None
         self.moe_kernel = make_nvfp4_moe_kernel(
@@ -298,6 +320,15 @@ class CompressedTensorsW4A4Nvfp4MoEMethod(CompressedTensorsMoEMethod):
         )
         self.moe_kernel.fused_experts.keep_constants(layer)
         self.moe_kernel.fused_experts.process_weights_after_loading(layer)
+
+    def _restore_padded_moe_dims(self, layer: RoutedExperts) -> None:
+        mc = layer.moe_config
+        padded_hidden = layer.w2_weight.shape[1]
+        if padded_hidden != mc.hidden_dim:
+            if mc.hidden_dim_unpadded is None:
+                mc.hidden_dim_unpadded = mc.hidden_dim
+            mc.hidden_dim = padded_hidden
+        mc.intermediate_size_per_partition = layer.w2_weight.shape[2] * 2
 
     def get_fused_moe_quant_config(self, layer: torch.nn.Module) -> FusedMoEQuantConfig:
         return make_nvfp4_moe_quant_config(

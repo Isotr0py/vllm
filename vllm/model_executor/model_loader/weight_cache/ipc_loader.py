@@ -622,8 +622,10 @@ def _materialize_remaining_meta_tensors(model: nn.Module, device: torch.device) 
 
     These are typically parameters removed on the daemon side by
     process_weights_after_loading; they are not expected to be read at
-    runtime, so they are left uninitialized.
+    runtime, so they are left uninitialized. Shared plain tensor attributes are
+    replaced by identity so all module references resolve to the same allocation.
     """
+    materialized: dict[int, torch.Tensor] = {}
     for module_name, module in model.named_modules():
         for leaf, param in list(module._parameters.items()):
             if param is not None and param.device.type == "meta":
@@ -638,3 +640,9 @@ def _materialize_remaining_meta_tensors(model: nn.Module, device: torch.device) 
         for leaf, buffer in list(module._buffers.items()):
             if buffer is not None and buffer.device.type == "meta":
                 module._buffers[leaf] = torch.empty_like(buffer, device=device)
+        for leaf, tensor in list(module.__dict__.items()):
+            if isinstance(tensor, torch.Tensor) and tensor.device.type == "meta":
+                key = id(tensor)
+                if key not in materialized:
+                    materialized[key] = torch.empty_like(tensor, device=device)
+                module.__dict__[leaf] = materialized[key]

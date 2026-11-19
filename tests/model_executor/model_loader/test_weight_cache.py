@@ -212,6 +212,7 @@ class ModelCase:
     # the on-disk FlashInfer autotune cache, and the restart engine reuses it
     # (needs SM90+/FlashInfer).
     check_flashinfer_cache: bool = False
+    load_format: str = "auto"
 
 
 def generate(
@@ -219,19 +220,27 @@ def generate(
     case: ModelCase,
     socket_dir: str | None,
     fallback: bool,
+    logprobs: bool = False,
 ):
     extra_config = (
         {} if socket_dir is None else {"socket_dir": socket_dir, "fallback": fallback}
     )
     with vllm_runner(
         case.model,
-        load_format="auto" if socket_dir is None else "ipc_cache",
+        load_format=case.load_format if socket_dir is None else "ipc_cache",
         model_loader_extra_config=extra_config,
         # Greedy outputs are compared across engine restarts; cap the batch
         # size so scheduling cannot change the results.
         max_num_seqs=1,
         **case.llm_kwargs,
     ) as llm:
+        if logprobs:
+            sampling_params = SamplingParams(
+                temperature=0, max_tokens=16, ignore_eos=True, logprobs=5
+            )
+            return llm.generate_w_logprobs(
+                case.prompts, sampling_params, images=case.images
+            )
         sampling_params = SamplingParams(temperature=0, max_tokens=16, ignore_eos=True)
         return llm.generate(case.prompts, sampling_params, images=case.images)
 
@@ -501,6 +510,71 @@ def test_ipc_cache_nvfp4_cutlass(vllm_runner, tmp_path, monkeypatch):
 
 
 @pytest.mark.skipif(
+    not (current_platform.is_cuda() and current_platform.has_device_capability(100)),
+    reason="MiniMax-M3.1 MSA kernels require SM100+",
+)
+def test_ipc_cache_minimax_m31_flash(vllm_runner, tmp_path):
+    """MiniMax-M3.1's shared top-k indices survive repeated IPC attachment."""
+    from vllm.transformers_utils.repo_utils import hf_api
+
+    model_dir = tmp_path / "minimax-m3.1-flash"
+    source = Path(
+        hf_api().snapshot_download(
+            "MiniMaxAI/MiniMax-M3.1-Flash",
+            allow_patterns=[
+                "config.json",
+                "generation_config.json",
+                "preprocessor_config.json",
+                "chat_template.jinja",
+                "tokenizer*.json",
+                "special_tokens_map.json",
+                "added_tokens.json",
+            ],
+        )
+    )
+    shutil.copytree(source, model_dir, symlinks=False)
+    config = json.loads((model_dir / "config.json").read_text())
+    text_config = config["text_config"]
+    layer_kinds = [0, 0, 0, 1, 1, 1]
+    text_config["num_hidden_layers"] = 6
+    text_config["moe_layer_freq"] = layer_kinds
+    sparse_config = text_config["sparse_attention_config"]
+    sparse_config["sparse_attention_freq"] = layer_kinds
+    sparse_config["sparse_disable_index_value"] = layer_kinds
+    (model_dir / "config.json").write_text(json.dumps(config))
+
+    kernel_config = {
+        "moe_backend": "flashinfer_trtllm",
+        "enable_flashinfer_autotune": False,
+    }
+    case = ModelCase(
+        model=str(model_dir),
+        prompts=["The capital of France is", "Hello, my name is"],
+        llm_kwargs=dict(
+            language_model_only=True,
+            tensor_parallel_size=1,
+            enforce_eager=True,
+            max_model_len=512,
+            block_size=128,
+            kernel_config=kernel_config,
+        ),
+        daemon_args=[
+            "--language-model-only",
+            "--max-model-len",
+            "512",
+            "--block-size",
+            "128",
+            "--kernel-config",
+            json.dumps(kernel_config),
+        ],
+        load_format="dummy",
+    )
+    run_cold_start_and_warm_restart(
+        vllm_runner, case, tmp_path, logprobs=True, cold_start=False
+    )
+
+
+@pytest.mark.skipif(
     not current_platform.is_cuda_alike(), reason="Requires CUDA or ROCm"
 )
 def test_ipc_fallback_restores_memory_budget(vllm_runner, enable_pickle):
@@ -722,35 +796,52 @@ def test_mooncake_warmup_cache_store_e2e(vllm_runner, tmp_path, monkeypatch):
     assert gen2_outputs == baseline_outputs
 
 
-def run_cold_start_and_warm_restart(vllm_runner, case: ModelCase, tmp_path, capfd=None):
+def run_cold_start_and_warm_restart(
+    vllm_runner,
+    case: ModelCase,
+    tmp_path,
+    capfd=None,
+    logprobs: bool = False,
+    cold_start: bool = True,
+):
     # Baseline: plain disk loading with the default loader.
     baseline_outputs = generate(
         vllm_runner,
         case,
         None,
         fallback=True,
+        logprobs=logprobs,
     )
-    assert all(text for _, texts in baseline_outputs for text in texts)
+    assert all(text for output in baseline_outputs for text in output[1])
 
-    # Cold start: no daemon is serving, so the loader falls back to disk.
-    with tempfile.TemporaryDirectory(prefix="vllm_ipc_empty_") as empty_socket_dir:
-        cold_outputs = generate(vllm_runner, case, empty_socket_dir, fallback=True)
+    cold_outputs = None
+    if cold_start:
+        # Cold start: no daemon is serving, so the loader falls back to disk.
+        with tempfile.TemporaryDirectory(prefix="vllm_ipc_empty_") as empty_socket_dir:
+            cold_outputs = generate(
+                vllm_runner, case, empty_socket_dir, fallback=True, logprobs=logprobs
+            )
 
     if case.check_flashinfer_cache:
         # The baseline engine already wrote its own (LLM_CLASS-keyed) table.
         engine_cache_files = set(tmp_path.rglob("autotune_configs*.json"))
 
+    daemon_args = list(case.daemon_args)
+    if case.load_format != "auto":
+        daemon_args += ["--load-format", case.load_format]
     with WeightCacheDaemon(
         case.model,
         tp_size=case.llm_kwargs.get("tensor_parallel_size", 1),
-        extra_args=case.daemon_args,
+        extra_args=daemon_args,
     ) as d:
         d.wait_until_ready()
         if "speculative_config" in case.llm_kwargs:
             # Draft daemons serve only the GPUs of the last pipeline stage.
             num_draft_sockets = len(list(Path(d.socket_dir).glob("*_draft.sock")))
             assert num_draft_sockets == case.llm_kwargs.get("tensor_parallel_size", 1)
-        warm_outputs = generate(vllm_runner, case, d.socket_dir, fallback=False)
+        warm_outputs = generate(
+            vllm_runner, case, d.socket_dir, fallback=False, logprobs=logprobs
+        )
         if case.check_flashinfer_cache:
             # Each daemon tunes before its ready report; exactly one new file
             # (their OPENAI_API_SERVER-keyed table) must appear.
@@ -762,7 +853,9 @@ def run_cold_start_and_warm_restart(vllm_runner, case: ModelCase, tmp_path, capf
         # Warm restart: a second engine lifetime against the same daemon.
         if case.check_flashinfer_cache:
             capfd.readouterr()  # drain: the assertion reads the increment
-        restart_outputs = generate(vllm_runner, case, d.socket_dir, fallback=False)
+        restart_outputs = generate(
+            vllm_runner, case, d.socket_dir, fallback=False, logprobs=logprobs
+        )
         if case.check_flashinfer_cache:
             # The restart's EngineCore subprocess inherits pytest's fds; the
             # flashinfer autotuner logs "[Autotuner]: Loaded N configs from
@@ -775,9 +868,28 @@ def run_cold_start_and_warm_restart(vllm_runner, case: ModelCase, tmp_path, capf
                 "restart engine did not load the on-disk autotune cache"
             )
 
-    assert cold_outputs == baseline_outputs
-    assert warm_outputs == baseline_outputs
-    assert restart_outputs == baseline_outputs
+    if logprobs:
+        from tests.models.utils import check_logprobs_close
+
+        comparisons = [
+            ("warm attach", warm_outputs),
+            ("warm restart", restart_outputs),
+        ]
+        if cold_outputs is not None:
+            comparisons.insert(0, ("cold start", cold_outputs))
+        for name, outputs in comparisons:
+            check_logprobs_close(
+                outputs_0_lst=baseline_outputs,
+                outputs_1_lst=outputs,
+                name_0="baseline",
+                name_1=name,
+                always_check_logprobs=True,
+            )
+    else:
+        if cold_outputs is not None:
+            assert cold_outputs == baseline_outputs
+        assert warm_outputs == baseline_outputs
+        assert restart_outputs == baseline_outputs
 
 
 def _parallel(**kw):
@@ -1127,6 +1239,43 @@ def test_ipc_rope_matching(
                 torch.testing.assert_close(model.rotary_cache, expected)
         finally:
             server_task.result(timeout=5)
+
+
+def test_materialize_remaining_meta_tensors_preserves_shared_attributes():
+    """Ordinary tensor attributes shared between modules stay shared."""
+    import torch
+
+    from vllm.model_executor.model_loader.weight_cache.ipc_loader import (
+        _materialize_remaining_meta_tensors,
+    )
+
+    model = torch.nn.Module()
+    model.attention = torch.nn.Module()
+    model.indexer = torch.nn.Module()
+    shared = torch.empty((2, 3), dtype=torch.int64, device="meta")
+    model.topk_indices_buffer = shared
+    model.attention.topk_indices_buffer = shared
+    model.indexer.topk_indices_buffer = shared
+    model.weight = torch.nn.Parameter(torch.empty(2, device="meta"))
+    model.register_buffer("meta_buffer", torch.empty(3, device="meta"))
+    real_tensor = torch.ones(1)
+    model.attention.real_tensor = real_tensor
+    model.attention.label = "unchanged"
+
+    _materialize_remaining_meta_tensors(model, torch.device("cpu"))
+
+    materialized = model.topk_indices_buffer
+    assert materialized.device.type == "cpu"
+    assert materialized.shape == shared.shape
+    assert materialized.dtype == shared.dtype
+    assert model.attention.topk_indices_buffer is materialized
+    assert model.indexer.topk_indices_buffer is materialized
+    assert model.attention.__dict__["topk_indices_buffer"] is materialized
+    assert isinstance(model.weight, torch.nn.Parameter)
+    assert model.weight.device.type == "cpu"
+    assert model.meta_buffer.device.type == "cpu"
+    assert model.attention.real_tensor is real_tensor
+    assert model.attention.label == "unchanged"
 
 
 def test_ipc_loader_copy_mode_reports_no_external_weight_memory():

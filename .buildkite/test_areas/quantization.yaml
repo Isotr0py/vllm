@@ -98,9 +98,11 @@ steps:
   - tests/quantization/test_blackwell_moe.py
   - tests/quantization/test_keep_param_objects.py
   - tests/model_executor/model_loader/test_reload_moe_kernels.py
+  - tests/model_executor/model_loader/test_weight_cache.py
   - tests/benchmarks/test_forward_cli.py
   - vllm/benchmarks/forward/
   - vllm/models/muse_spark/
+  - vllm/models/minimax_m3/
   - vllm/model_executor/models/deepseek_v2.py
   - vllm/model_executor/models/gpt_oss.py
   - vllm/model_executor/models/llama4.py
@@ -114,6 +116,7 @@ steps:
   - vllm/model_executor/layers/quantization/utils/flashinfer_fp4_moe.py
   - vllm/model_executor/utils.py
   - vllm/model_executor/model_loader/reload/
+  - vllm/model_executor/model_loader/weight_cache/
   - vllm/distributed/localization.py
   - vllm/v1/attention/backends/flashinfer.py
   commands:
@@ -122,6 +125,7 @@ steps:
       tests/quantization/test_blackwell_moe.py
       tests/quantization/test_keep_param_objects.py
       tests/model_executor/model_loader/test_reload_moe_kernels.py
+      tests/model_executor/model_loader/test_weight_cache.py::test_ipc_cache_minimax_m31_flash
       tests/benchmarks/test_forward_cli.py::test_bench_forward_muse_synthetic_routing
   mirror:
     amd:

@@ -197,6 +197,210 @@ def test_modelopt_mxfp8_routes_nvfp4_experts_to_compressed_tensors(monkeypatch):
     assert plain.moe_quant_algo is None
 
 
+def _make_m31_nvfp4_layer() -> RoutedExperts:
+    from tests.kernels.moe.utils import make_dummy_moe_config
+    from vllm.model_executor.layers.fused_moe.activation import MoEActivation
+    from vllm.model_executor.layers.fused_moe.expert_map_manager import (
+        ExpertMapManager,
+    )
+
+    moe_config = make_dummy_moe_config(
+        num_experts=2,
+        hidden_dim=128,
+        intermediate_size=32,
+        activation=MoEActivation.SWIGLUOAI_UNINTERLEAVE,
+    )
+    moe_config.device = "cpu"
+    moe_config.moe_backend = "flashinfer_trtllm"
+    moe_config.qat_activation_key = kNvfp4DynamicToken
+    moe_config.swiglu_limit = 7.0
+    moe_config.swiglu_alpha = 1.702
+    moe_config.swiglu_beta = 1.0
+    expert_map_manager = ExpertMapManager(
+        max_num_batched_tokens=16,
+        top_k=moe_config.experts_per_token,
+        global_num_experts=moe_config.num_experts,
+        num_redundant_experts=0,
+        num_expert_group=None,
+        moe_parallel_config=moe_config.moe_parallel_config,
+        placement_strategy="linear",
+        enable_eplb=False,
+    )
+    return RoutedExperts(
+        "model.layers.3.block_sparse_moe.experts",
+        torch.bfloat16,
+        moe_config,
+        ModelOptMxFp8Config.from_config(dict(_M31_QUANT_CONFIG)),
+        expert_map_manager,
+        ckpt_gate_proj_name="w1",
+        ckpt_down_proj_name="w2",
+        ckpt_up_proj_name="w3",
+        swiglu_limit=7.0,
+        swiglu_alpha=1.702,
+        swiglu_beta=1.0,
+    )
+
+
+def test_m31_nvfp4_pre_processed_weights_restore_kernel_state(monkeypatch):
+    """Cold-processed TRTLLM parameters restore on meta without reprocessing."""
+    from vllm.model_executor.layers.fused_moe.activation import MoEActivation
+    from vllm.model_executor.layers.fused_moe.experts.trtllm_nvfp4_moe import (
+        TrtLlmNvFp4ExpertsMonolithic,
+    )
+    from vllm.model_executor.layers.fused_moe.oracle.nvfp4 import NvFp4MoeBackend
+    from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w4a4_nvfp4 import (  # noqa: E501
+        CompressedTensorsW4A4Nvfp4MoEMethod,
+    )
+    from vllm.model_executor.model_loader.weight_cache.daemon import export_entries
+    from vllm.model_executor.model_loader.weight_cache.ipc_loader import (
+        IpcModelLoader,
+    )
+    from vllm.model_executor.model_loader.weight_cache.protocol import (
+        WeightCacheState,
+    )
+    from vllm.model_executor.utils import weights_already_processed
+
+    module = (
+        "vllm.model_executor.layers.quantization.compressed_tensors."
+        "compressed_tensors_moe.compressed_tensors_moe_w4a4_nvfp4"
+    )
+    monkeypatch.setattr(
+        f"{module}.select_nvfp4_moe_backend",
+        lambda **kwargs: (
+            NvFp4MoeBackend.FLASHINFER_TRTLLM,
+            TrtLlmNvFp4ExpertsMonolithic,
+        ),
+    )
+    # Isolate the CUDA-only device query and block-scale interleave on CPU.
+    monkeypatch.setattr(
+        "torch.accelerator.current_device_index", lambda: torch.device("cpu")
+    )
+    monkeypatch.setattr(
+        "flashinfer.nvfp4_block_scale_interleave", lambda scale: scale.reshape(-1)
+    )
+
+    with set_current_vllm_config(VllmConfig()):
+        cold = _make_m31_nvfp4_layer()
+        with torch.no_grad():
+            for name, param in cold.named_parameters():
+                value = 0.25 if name == "w2_input_global_scale" else 0.5
+                param.fill_(1 if param.dtype == torch.uint8 else value)
+        cold.quant_method.process_weights_after_loading(cold)
+
+        entries, aliases = export_entries(cold)
+        assert "w13_input_scale" in entries
+        assert "w2_input_scale" in entries
+        assert aliases["w13_weight"] == "w13_weight_packed"
+        assert aliases["w2_weight"] == "w2_weight_packed"
+
+        with torch.device("meta"):
+            warm = _make_m31_nvfp4_layer()
+        loader = IpcModelLoader(
+            LoadConfig(
+                load_format="ipc_cache",
+                model_loader_extra_config={"mode": "copy"},
+            )
+        )
+        loader._apply_entries(warm, WeightCacheState(entries, aliases, {}), 0)
+
+        def unexpected_conversion(**kwargs):
+            raise AssertionError("pre-processed weights were converted again")
+
+        monkeypatch.setattr(
+            f"{module}.convert_to_nvfp4_moe_kernel_format", unexpected_conversion
+        )
+        with weights_already_processed():
+            warm.quant_method.process_weights_after_loading(warm)
+
+    for layer in (cold, warm):
+        assert layer.activation is MoEActivation.SWIGLUOAI_UNINTERLEAVE
+        assert layer.moe_config.qat_activation_key is kNvfp4DynamicToken
+        quant_method = layer.quant_method
+        assert isinstance(quant_method, CompressedTensorsW4A4Nvfp4MoEMethod)
+        assert quant_method.per_token_activation
+        moe_kernel = quant_method.moe_kernel
+        assert moe_kernel is not None
+        assert isinstance(
+            moe_kernel.fused_experts,
+            TrtLlmNvFp4ExpertsMonolithic,
+        )
+        assert layer.swiglu_limit == layer.moe_config.swiglu_limit == 7.0
+        assert layer.swiglu_alpha == layer.moe_config.swiglu_alpha == 1.702
+        assert layer.swiglu_beta == layer.moe_config.swiglu_beta == 1.0
+        torch.testing.assert_close(
+            layer.w13_input_scale, torch.ones_like(layer.w13_input_scale)
+        )
+        torch.testing.assert_close(
+            layer.w2_input_scale, torch.ones_like(layer.w2_input_scale)
+        )
+
+    assert warm.w13_weight is warm.w13_weight_packed
+    assert warm.w2_weight is warm.w2_weight_packed
+    assert warm.moe_config.hidden_dim == 256
+    assert warm.moe_config.hidden_dim_unpadded == 128
+    assert warm.moe_config.intermediate_size_per_partition == 64
+    compared_names = (
+        "w13_weight",
+        "w2_weight",
+        "w13_weight_scale",
+        "w2_weight_scale",
+        "w13_weight_scale_2",
+        "w2_weight_scale_2",
+        "w13_input_scale",
+        "w2_input_scale",
+        "g1_scale_c",
+        "gemm1_clamp_limit",
+        "gemm1_beta",
+        "gemm1_alpha",
+    )
+    for name in compared_names:
+        assert torch.equal(getattr(warm, name), getattr(cold, name)), name
+    assert warm.quant_method.moe_quant_config is not None
+    assert warm.quant_method.moe_quant_config.g1_alphas is warm.w13_weight_scale_2
+    assert warm.quant_method.moe_quant_config.g2_alphas is warm.w2_weight_scale_2
+
+    stable_names = (*compared_names, "_a1_gscale", "_a2_gscale")
+    before_reload = {
+        name: (param, param.data_ptr(), param.detach().clone())
+        for name in stable_names
+        if (param := getattr(warm, name)) is not None
+    }
+    with weights_already_processed():
+        warm.quant_method.process_weights_after_loading(warm)
+    for name, (param, data_ptr, value) in before_reload.items():
+        reloaded = getattr(warm, name)
+        assert reloaded is param, name
+        assert reloaded.data_ptr() == data_ptr, name
+        assert torch.equal(reloaded, value), name
+    for name in compared_names:
+        assert torch.equal(getattr(warm, name), getattr(cold, name)), name
+
+
+def test_compressed_nvfp4_rejects_pre_processed_cutedsl_weights(monkeypatch):
+    from tests.kernels.moe.utils import make_dummy_moe_config
+    from vllm.model_executor.layers.fused_moe.experts.flashinfer_cutedsl_moe import (
+        FlashInferCuteDSLExperts,
+    )
+    from vllm.model_executor.layers.fused_moe.oracle.nvfp4 import NvFp4MoeBackend
+    from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w4a4_nvfp4 import (  # noqa: E501
+        CompressedTensorsW4A4Nvfp4MoEMethod,
+    )
+
+    module = (
+        "vllm.model_executor.layers.quantization.compressed_tensors."
+        "compressed_tensors_moe.compressed_tensors_moe_w4a4_nvfp4"
+    )
+    monkeypatch.setattr(
+        f"{module}.select_nvfp4_moe_backend",
+        lambda **kwargs: (
+            NvFp4MoeBackend.FLASHINFER_CUTEDSL,
+            FlashInferCuteDSLExperts,
+        ),
+    )
+    method = CompressedTensorsW4A4Nvfp4MoEMethod(make_dummy_moe_config())
+    assert not method.supports_pre_processed_weights
+
+
 def test_per_token_nvfp4_moe_backends_match_the_experts_that_implement_it():
     """`make_nvfp4_moe_kernel` dispatches unquantized inputs for a per-token
     scheme and only forwards `per_token_activation` to this set, so it has to
