@@ -171,7 +171,7 @@ class Mxfp4MoeBackend(Enum):
     AITER_MXFP4_BF16 = "AITER_MXFP4_BF16"  # W4A16: CK kernel (gfx950)
     # Legacy alias, resolves to the CK kernel. New code should name either
     # AITER_MXFP4_BF16 (CK) or AITER_TRITON_MXFP4_BF16 (Triton) explicitly.
-    AITER = "AITER_MXFP4_BF16"
+    AITER = "AITER_MXFP4_BF16"  # enum-alias: ok (legacy CK backend name)
     # W4A16: aiter Triton moe_gemm_a16w4 kernel (gfx942/gfx950/gfx1250)
     AITER_TRITON_MXFP4_BF16 = "AITER_TRITON_MXFP4_BF16"
     AITER_MXFP4_FP8 = "AITER_MXFP4_FP8"  # W4A8: triton kernel

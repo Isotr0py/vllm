@@ -402,6 +402,13 @@ repos:
     require_serial: true
     stages: [pre-commit] # Only run locally as Buildkite will cover this
     files: ^rust/.*(\.rs|Cargo\.toml|rustfmt\.toml)$
+  - id: check-enum-aliases
+    name: Check for duplicate enum values
+    entry: python tools/pre_commit/check_enum_aliases.py
+    language: python
+    files: ^vllm/
+    types: [python]
+    additional_dependencies: [regex]
   # Keep `suggestion` last
   - id: suggestion
     name: Suggestion
