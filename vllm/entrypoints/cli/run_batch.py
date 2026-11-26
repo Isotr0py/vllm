@@ -54,7 +54,7 @@ class RunBatchSubcommand(CLISubcommand):
 
         run_batch_parser = subparsers.add_parser(
             self.name,
-            help="Run batch prompts and write results to file.",
+            help=self.help,
             description=(
                 "Run batch prompts using vLLM's OpenAI-compatible API.\n"
                 "Supports local or HTTP input/output files."

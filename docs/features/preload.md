@@ -34,6 +34,10 @@ Launch one weight cache daemon per GPU with a single command:
 vllm preload --model meta-llama/Llama-3.1-8B-Instruct --tensor-parallel-size 4
 ```
 
+With one local rank, the CLI process serves that rank directly. With multiple
+local ranks (including a separate draft group), a lightweight launcher monitors
+the rank processes and reports readiness once all serving ranks are listening.
+
 The daemon process loads, post-processes and warms up the weights once, then
 publishes their final state and waits for engines. Each rank binds its Unix
 socket only after that state is ready, so engines connecting before then simply

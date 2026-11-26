@@ -1,14 +1,19 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from __future__ import annotations
+
 import dataclasses
 import os
 from argparse import Namespace
 from logging import Logger
 from string import Template
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-from vllm import EngineArgs, envs
+from vllm import envs
 from vllm.logger import current_formatter_type, init_logger
+
+if TYPE_CHECKING:
+    from vllm import EngineArgs
 
 logger = init_logger(__name__)
 
@@ -61,6 +66,7 @@ def redact_sensitive_args(args: dict[str, Any]) -> dict[str, Any]:
 
 
 def get_non_default_args(args: Namespace | EngineArgs) -> dict[str, Any]:
+    from vllm import EngineArgs
     from vllm.entrypoints.common.cli_args import make_arg_parser
     from vllm.utils.argparse_utils import FlexibleArgumentParser
 

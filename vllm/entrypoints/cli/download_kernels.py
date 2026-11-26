@@ -72,7 +72,7 @@ class DownloadKernelsSubcommand(CLISubcommand):
     ) -> FlexibleArgumentParser:
         parser = subparsers.add_parser(
             self.name,
-            help="Install precompiled kernels for faster startup.",
+            help=self.help,
             description=(
                 "Install the precompiled kernels that vLLM's dependencies would "
                 "otherwise download or compile at startup. Run it after "

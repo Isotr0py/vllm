@@ -170,6 +170,28 @@ def _run_cli(argv: list[str]) -> None:
         cli_main.main()
 
 
+@pytest.mark.parametrize("argv", [["--help"], ["chat", "--help"]])
+def test_cli_help_does_not_load_the_engine(argv):
+    # A fresh interpreter makes unrelated CLI imports observable.
+    script = """
+import sys
+from vllm.entrypoints.cli.main import main
+
+try:
+    main()
+finally:
+    assert "vllm.engine.arg_utils" not in sys.modules
+    assert "vllm.entrypoints.cli.serve" not in sys.modules
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script, *argv],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert "usage:" in result.stdout
+
+
 def test_snapshot_environment_contract(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

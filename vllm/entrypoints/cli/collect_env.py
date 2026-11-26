@@ -28,8 +28,8 @@ class CollectEnvSubcommand(CLISubcommand):
     ) -> FlexibleArgumentParser:
         return subparsers.add_parser(
             "collect-env",
-            help="Start collecting environment information.",
-            description="Start collecting environment information.",
+            help=self.help,
+            description=self.help,
             usage="vllm collect-env",
         )
 

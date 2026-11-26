@@ -98,6 +98,10 @@ class SnapshotSubcommand(CLISubcommand):
     def __init__(self, *, create_requested: bool = False) -> None:
         self.create_requested = create_requested
 
+    def prepare(self, argv: list[str]) -> None:
+        # Snapshot inspects the caller's environment before applying engine defaults.
+        self.create_requested = argv[:1] == ["create"]
+
     @staticmethod
     def cmd(args: argparse.Namespace) -> None:
         args.snapshot_dispatch(args)
@@ -107,7 +111,7 @@ class SnapshotSubcommand(CLISubcommand):
     ) -> FlexibleArgumentParser:
         parser = subparsers.add_parser(
             self.name,
-            help="Create, inspect, or restore an initialized vLLM snapshot.",
+            help=self.help,
             usage="vllm snapshot <create|inspect|restore> [options]",
         )
         actions = parser.add_subparsers(required=True, dest="snapshot_action")

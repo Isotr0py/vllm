@@ -163,8 +163,7 @@ class ServeSubcommand(CLISubcommand):
     ) -> FlexibleArgumentParser:
         serve_parser = subparsers.add_parser(
             self.name,
-            help="Launch a local OpenAI-compatible API server to serve LLM "
-            "completions via HTTP.",
+            help=self.help,
             description=DESCRIPTION,
             usage="vllm serve [model_tag] [options]",
         )

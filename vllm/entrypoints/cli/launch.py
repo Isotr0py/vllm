@@ -6,6 +6,7 @@ import inspect
 
 import uvloop
 
+from vllm.entrypoints.cli.registry import COMMANDS
 from vllm.entrypoints.cli.types import CLISubcommand
 from vllm.entrypoints.common.cli_args import (
     make_arg_parser,
@@ -18,7 +19,7 @@ from vllm.utils.argparse_utils import FlexibleArgumentParser
 
 logger = init_logger(__name__)
 
-DESCRIPTION = "Launch individual vLLM components."
+DESCRIPTION = COMMANDS["launch"].help
 
 
 class LaunchSubcommandBase(CLISubcommand):

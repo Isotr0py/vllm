@@ -241,8 +241,8 @@ class ChatCommand(CLISubcommand):
     ) -> FlexibleArgumentParser:
         parser = subparsers.add_parser(
             "chat",
-            help="Generate chat completions via the running API server.",
-            description="Generate chat completions via the running API server.",
+            help=self.help,
+            description=self.help,
             usage="vllm chat [options]",
         )
         return ChatCommand.add_cli_args(parser)
@@ -309,14 +309,8 @@ class CompleteCommand(CLISubcommand):
     ) -> FlexibleArgumentParser:
         parser = subparsers.add_parser(
             "complete",
-            help=(
-                "Generate text completions based on the given prompt "
-                "via the running API server."
-            ),
-            description=(
-                "Generate text completions based on the given prompt "
-                "via the running API server."
-            ),
+            help=self.help,
+            description=self.help,
             usage="vllm complete [options]",
         )
         return CompleteCommand.add_cli_args(parser)

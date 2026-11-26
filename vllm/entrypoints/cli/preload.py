@@ -23,94 +23,27 @@ replica (`--weight-cache-seed`); see `docs/features/preload.md`.
 """
 
 import argparse
-import multiprocessing
-import queue
-import signal
-import sys
-import threading
-import time
 import typing
-from collections.abc import Sequence
-from itertools import product
-from multiprocessing.connection import wait
-from multiprocessing.process import BaseProcess
+from functools import partial
 
-from fastapi import FastAPI
-from fastapi.responses import Response
-
-from vllm.engine.arg_utils import EngineArgs
+from vllm.entrypoints.cli.preload_launcher import (
+    LaunchInfo,
+    RankMain,
+    maybe_launch_workers,
+    run_inline,
+    supervise_prepared,
+)
 from vllm.entrypoints.cli.types import CLISubcommand
 from vllm.entrypoints.common.startup import VLLM_SUBCMD_PARSER_EPILOG
-from vllm.logger import init_logger
-from vllm.model_executor.model_loader.weight_cache.protocol import (
-    check_ipc_platform_support,
-)
-from vllm.model_executor.model_loader.weight_cache.weight_seed.utils import (
-    SeedAddress,
-    mirror_device_indices,
-    parse_seed_addresses,
-    peer_cache_config,
-    seed_address,
-)
-from vllm.usage.usage_lib import UsageContext
-from vllm.utils.network_utils import get_distributed_init_method, get_open_port
 
 if typing.TYPE_CHECKING:
     from vllm.config import VllmConfig
+    from vllm.model_executor.model_loader.weight_cache.weight_seed.utils import (
+        SeedAddress,
+    )
     from vllm.utils.argparse_utils import FlexibleArgumentParser
 else:
     FlexibleArgumentParser = argparse.ArgumentParser
-
-logger = init_logger(__name__)
-
-
-class _HealthState:
-    def __init__(self, processes: Sequence[BaseProcess]) -> None:
-        self.processes = processes
-        self._ready = False
-        self._lock = threading.Lock()
-
-    def mark_ready(self) -> None:
-        with self._lock:
-            self._ready = True
-
-    @property
-    def is_ready(self) -> bool:
-        with self._lock:
-            ready = self._ready
-        return ready and not any(proc.exitcode is not None for proc in self.processes)
-
-
-def _build_health_app(state: _HealthState) -> FastAPI:
-    app = FastAPI(openapi_url=None, docs_url=None, redoc_url=None)
-
-    @app.get("/health", include_in_schema=False)
-    async def health() -> Response:
-        return Response(status_code=200 if state.is_ready else 503)
-
-    return app
-
-
-def _start_health_server(
-    host: str, port: int, state: _HealthState
-) -> tuple[typing.Any, threading.Thread]:
-    import uvicorn
-
-    config = uvicorn.Config(
-        _build_health_app(state),
-        host=host,
-        port=port,
-        log_level="error",
-        access_log=False,
-    )
-    server = uvicorn.Server(config)
-    thread = threading.Thread(
-        target=server.run,
-        name="vllm-weight-cache-health",
-        daemon=True,
-    )
-    thread.start()
-    return server, thread
 
 
 def _validate_seed_args(
@@ -120,9 +53,9 @@ def _validate_seed_args(
     num_groups: int,
     nnodes: int,
     local_world_size: int,
-    addresses: list[SeedAddress],
+    addresses: list["SeedAddress"],
 ) -> None:
-    """Validate the seed CLI options before any daemon spawns."""
+    """Validate the seed CLI options before any rank starts loading."""
     for flag, host, port in (
         ("--seed-listen", args.seed_listen_host, args.seed_listen_port),
         ("--seed-source", args.seed_source_host, args.seed_source_port),
@@ -180,8 +113,13 @@ class PreloadSubcommand(CLISubcommand):
 
     name = "preload"
 
+    def prepare(self, argv: list[str]) -> None:
+        super().prepare(argv)
+        maybe_launch_workers(argv)
+
     @staticmethod
     def add_cli_args(parser: FlexibleArgumentParser) -> None:
+        from vllm.engine.arg_utils import EngineArgs
         from vllm.model_executor.model_loader.weight_cache.ipc_backends import (
             IPC_BACKENDS,
         )
@@ -291,7 +229,15 @@ class PreloadSubcommand(CLISubcommand):
 
     @staticmethod
     def cmd(args: argparse.Namespace) -> None:
-        # Imported here so `vllm --help` and friends stay free of torch.
+        info, ranks = PreloadSubcommand.build_plan(args)
+        if len(ranks) == 1:
+            run_inline(info, ranks[0])
+        else:
+            supervise_prepared(info, ranks)
+
+    @staticmethod
+    def build_plan(args: argparse.Namespace) -> tuple[LaunchInfo, list[RankMain]]:
+        from vllm.engine.arg_utils import EngineArgs
         from vllm.model_executor.model_loader.weight_cache.daemon import (
             _reject_unsupported_parallelism,
             _run_daemon,
@@ -299,13 +245,21 @@ class PreloadSubcommand(CLISubcommand):
             get_draft_daemon_config,
             plan_local_ranks,
         )
-        from vllm.model_executor.model_loader.weight_cache.transport import SeedConfig
-        from vllm.model_executor.model_loader.weight_cache.utils import (
-            format_daemon_role,
+        from vllm.model_executor.model_loader.weight_cache.protocol import (
+            check_ipc_platform_support,
         )
+        from vllm.model_executor.model_loader.weight_cache.transport import SeedConfig
         from vllm.model_executor.model_loader.weight_cache.weight_seed.seed import (
             WEIGHT_COPY_LEASE_TIMEOUT_S,
         )
+        from vllm.model_executor.model_loader.weight_cache.weight_seed.utils import (
+            mirror_device_indices,
+            parse_seed_addresses,
+            peer_cache_config,
+            seed_address,
+        )
+        from vllm.usage.usage_lib import UsageContext
+        from vllm.utils.network_utils import get_distributed_init_method, get_open_port
 
         engine_args = EngineArgs.from_cli_args(args)
         # Warmup context for flashinfer autotune.
@@ -389,19 +343,6 @@ class PreloadSubcommand(CLISubcommand):
                 )
             )
 
-        ctx = multiprocessing.get_context("spawn")
-        ready_queue: multiprocessing.Queue[tuple[str, int]] = ctx.Queue()
-        # Local index == device index; global rank enumerates DP, PP, then TP.
-        expected_ready = {
-            (
-                format_daemon_role(is_draft),
-                dp_rank * pp_size * tp_size + pp_rank * tp_size + tp_rank,
-            )
-            for (is_draft, _, _), (_, dp_rank, pp_rank, tp_rank) in product(
-                groups, placements
-            )
-            if daemon_serves_model(is_draft, pp_rank, pp_size)
-        }
         seed_addresses = parse_seed_addresses(args.weight_cache_seed)
         _validate_seed_args(
             args,
@@ -433,8 +374,8 @@ class PreloadSubcommand(CLISubcommand):
             # source replica does not use, inferred from the source's GPUs.
             mirror_devices = mirror_device_indices(seed_addresses, local_world_size)
 
-        procs: list[BaseProcess] = []
-        serving: list[BaseProcess] = []
+        ranks: list[RankMain] = []
+        serving = []
         for group_index, (is_draft, config, init_method) in enumerate(groups):
             # Draft daemons live past the target group's port block at every
             # source node.
@@ -469,133 +410,42 @@ class PreloadSubcommand(CLISubcommand):
                     source=source,
                     token=args.seed_token,
                 )
-                procs.append(
-                    ctx.Process(
-                        target=_run_daemon,
-                        args=(
-                            global_rank,
-                            local_rank,
-                            daemon_config,
-                            init_method,
-                            args.weight_cache_socket_dir,
-                            ready_queue,
-                            is_draft,
-                            dp_rank,
-                            pp_rank,
-                            seed_config,
-                            mirror_devices[local_rank]
-                            if mirror_devices is not None
-                            else None,
-                            warmup_cache_stores,
-                            args.weight_cache_backend,
-                        ),
-                        name=(
-                            f"vllm-weight-cache-{format_daemon_role(is_draft)}-"
-                            f"{global_rank}"
-                        ),
+                ranks.append(
+                    partial(
+                        _run_daemon,
+                        global_rank=global_rank,
+                        local_rank=local_rank,
+                        vllm_config=daemon_config,
+                        distributed_init_method=init_method,
+                        socket_dir=args.weight_cache_socket_dir,
+                        is_draft=is_draft,
+                        dp_rank=dp_rank,
+                        pp_rank=pp_rank,
+                        seed_config=seed_config,
+                        device_index=mirror_devices[local_rank]
+                        if mirror_devices
+                        else None,
+                        warmup_cache_stores=warmup_cache_stores,
+                        weight_cache_backend=args.weight_cache_backend,
                     )
                 )
-                if daemon_serves_model(is_draft, pp_rank, pp_size):
-                    serving.append(procs[-1])
-        health_state = _HealthState(serving)
-        health_server = None
-        health_thread = None
-        if args.weight_cache_health_port is not None:
-            health_server, health_thread = _start_health_server(
-                args.weight_cache_health_host,
-                args.weight_cache_health_port,
-                health_state,
-            )
-        shutdown_requested = False
-        exit_code = 0
-
-        def _shutdown(signum, frame):
-            nonlocal shutdown_requested, exit_code
-            shutdown_requested = True
-            exit_code = 128 + signum
-
-        signal.signal(signal.SIGINT, _shutdown)
-        signal.signal(signal.SIGTERM, _shutdown)
-
-        started: list[BaseProcess] = []
-        try:
-            for proc in procs:
-                if shutdown_requested:
-                    break
-                proc.start()
-                started.append(proc)
-
-            ready: set[tuple[str, int]] = set()
-            while not shutdown_requested:
-                # Daemons that serve no model exit cleanly after the rendezvous.
-                dead = [
-                    p
-                    for p in procs
-                    if p.exitcode is not None and (p in serving or p.exitcode != 0)
-                ]
-                if dead:
-                    logger.error(
-                        "Weight cache daemon rank(s) exited during %s "
-                        "(exitcodes=%s); shutting down.",
-                        "serving" if ready == expected_ready else "startup",
-                        [p.exitcode for p in dead],
-                    )
-                    # Preserve the failure before terminating healthy siblings.
-                    # A clean rank exit is also unexpected while serving.
-                    failure = next((code for p in dead if (code := p.exitcode)), 1)
-                    exit_code = 128 - failure if failure < 0 else failure
-                    break
-                if ready == expected_ready:
-                    wait([p.sentinel for p in serving], timeout=1.0)
-                    continue
-                try:
-                    ready.add(ready_queue.get(timeout=1.0))
-                except queue.Empty:
-                    continue
-                if ready == expected_ready:
-                    health_state.mark_ready()
-                    socket_dir_msg = (
-                        args.weight_cache_socket_dir or "the default socket dir"
-                    )
-                    logger.info_once(
-                        "===== Weight cache daemon READY: node %d/%d serving %d "
-                        "daemon(s) in %s =====",
-                        node_rank,
-                        nnodes,
-                        len(expected_ready),
-                        socket_dir_msg,
-                    )
-        finally:
-            if health_server is not None:
-                health_server.should_exit = True
-            for proc in started:
-                if proc.is_alive():
-                    proc.terminate()
-            # SIGTERM runs the daemon's lease-aware cleanup. Leave enough
-            # time for outstanding copies to acknowledge before escalating
-            # during an external shutdown; fail fast when a rank has exited.
-            grace_period = (
-                WEIGHT_COPY_LEASE_TIMEOUT_S + 30.0 if shutdown_requested else 10.0
-            )
-            deadline = time.monotonic() + grace_period
-            for proc in started:
-                proc.join(timeout=max(0.0, deadline - time.monotonic()))
-            for proc in started:
-                if proc.is_alive():
-                    proc.kill()
-            for proc in started:
-                proc.join()
-            if health_thread is not None:
-                health_thread.join()
-            ready_queue.close()
-        sys.exit(exit_code)
+                serving.append(daemon_serves_model(is_draft, pp_rank, pp_size))
+        return LaunchInfo(
+            node_rank,
+            nnodes,
+            args.weight_cache_socket_dir,
+            args.weight_cache_health_host,
+            args.weight_cache_health_port,
+            tuple(serving),
+            WEIGHT_COPY_LEASE_TIMEOUT_S + 30,
+        ), ranks
 
     def subparser_init(
         self, subparsers: argparse._SubParsersAction
     ) -> FlexibleArgumentParser:
         preload_parser = subparsers.add_parser(
             self.name,
-            help="Launch weight cache daemons (one per GPU) for fast engine restarts.",
+            help=self.help,
             description="Launch weight cache daemons (one per GPU) that "
             "keep post-quantized weights in GPU memory and serve them to "
             "engines over GPU IPC.",

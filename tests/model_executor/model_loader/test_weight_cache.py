@@ -419,6 +419,12 @@ def test_weight_cache_backend_llm_restart(vllm_runner, tmp_path, monkeypatch, ba
         ],
     ) as daemon:
         daemon.wait_until_ready()
+        # A single local rank serves the socket in the original CLI process.
+        assert daemon._proc is not None
+        (socket_path,) = Path(daemon.socket_dir).glob("*.sock")
+        assert str(socket_path) in {
+            c.laddr for c in psutil.Process(daemon._proc.pid).net_connections("unix")
+        }
         extra_config = {"socket_dir": daemon.socket_dir, "fallback": False}
         with vllm_runner(
             str(tmp_path),
@@ -463,6 +469,9 @@ def test_preload_rank_failure_stops_launcher_and_siblings(after_ready, stop_sibl
                 time.sleep(0.1)
             if after_ready:
                 daemon.wait_until_ready()
+                assert not any(
+                    m.path.endswith("/libtorch_cpu.so") for m in parent.memory_maps()
+                )
             if stop_sibling:
                 # A stopped process cannot handle SIGTERM; cleanup must escalate.
                 children[0].send_signal(signal.SIGSTOP)

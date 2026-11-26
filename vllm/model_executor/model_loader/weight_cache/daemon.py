@@ -86,10 +86,8 @@ with `--weight-cache-seed`; see `docs/features/preload.md`.
 import contextlib
 import fcntl
 import gc
-import multiprocessing
 import os
 import select
-import signal
 import socket
 import time
 from collections.abc import Callable, Iterable
@@ -113,7 +111,7 @@ from vllm.distributed import (
 from vllm.distributed.device_communicators.flashinfer_all_reduce import (
     destroy_fi_ar_workspace,
 )
-from vllm.logger import configure_logging, init_logger
+from vllm.logger import configure_logging_if_needed, init_logger, set_vllm_process_name
 from vllm.model_executor.model_loader import get_model_loader
 from vllm.model_executor.model_loader.utils import process_weights_after_loading
 from vllm.model_executor.model_loader.weight_cache.ipc_backends.base import StorageEntry
@@ -136,7 +134,6 @@ from vllm.model_executor.model_loader.weight_cache.transport import (
     SeedTransport,
 )
 from vllm.model_executor.model_loader.weight_cache.utils import (
-    DaemonRole,
     build_weight_cache_key,
     collect_tensors,
     export_model_attrs,
@@ -411,12 +408,6 @@ class WeightCacheDaemon:
                 so the launcher can report overall readiness.
 
         """
-
-        def _shutdown(signum, frame):
-            raise SystemExit(128 + signum)
-
-        signal.signal(signal.SIGINT, _shutdown)
-        signal.signal(signal.SIGTERM, _shutdown)
         socket_path = self._socket_path
         ensure_private_socket_dir(
             os.path.dirname(socket_path), strict_perms=self.socket_dir is None
@@ -437,10 +428,9 @@ class WeightCacheDaemon:
             self.global_rank,
             socket_path,
         )
-        if ready_callback is not None:
-            ready_callback()
-
         try:
+            if ready_callback is not None:
+                ready_callback()
             while True:
                 conn, _ = server.accept()
                 self._serve_connection(conn)
@@ -612,12 +602,13 @@ class WeightCacheDaemon:
 
 
 def _run_daemon(
+    ready_callback: Callable[[], None],
+    *,
     global_rank: int,
     local_rank: int,
     vllm_config: VllmConfig,
     distributed_init_method: str,
     socket_dir: str | None,
-    ready_queue: "multiprocessing.Queue[tuple[DaemonRole, int]]",
     is_draft: bool = False,
     dp_rank: int = 0,
     pp_rank: int = 0,
@@ -626,9 +617,12 @@ def _run_daemon(
     warmup_cache_stores: Iterable[str] = (),
     weight_cache_backend: str = "torch_ipc",
 ) -> None:
+    set_vllm_process_name(
+        f"vllm-weight-cache-{format_daemon_role(is_draft)}-{global_rank}"
+    )
     # Spawned daemons start with logging unconfigured, like engine workers.
     if logging_config := getattr(vllm_config, "logging_config", None):
-        configure_logging(logging_config)
+        configure_logging_if_needed(logging_config)
     daemon = WeightCacheDaemon(
         vllm_config,
         global_rank,
@@ -653,9 +647,7 @@ def _run_daemon(
     # listener becomes available to target daemons.
     daemon.d2d.start_listener()
     daemon.release_distributed()
-    daemon.serve_forever(
-        ready_callback=lambda: ready_queue.put((daemon.role, daemon.global_rank))
-    )
+    daemon.serve_forever(ready_callback=ready_callback)
 
 
 def plan_local_ranks(

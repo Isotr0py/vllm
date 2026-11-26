@@ -62,6 +62,8 @@ CHECK_STRINGS = {
             "vllm/distributed/weight_transfer/clients.py",
             "examples/rl/rlhf_http_ipc_no_vllm.py",
             "vllm/model_executor/model_loader/weight_cache/ipc_backends/serial_utils.py",
+            # Private rank tasks passed via inherited temporary file or spawn queues.
+            "vllm/entrypoints/cli/preload_launcher.py",
             "tests/distributed/test_shm_broadcast.py",
             "tests/distributed/test_weight_transfer.py",
             "vllm/utils/hashing.py",
