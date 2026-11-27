@@ -1257,108 +1257,70 @@ def run_cold_start_and_warm_restart(vllm_runner, case: ModelCase, tmp_path, capf
     assert restart_outputs == baseline_outputs
 
 
-def _parallel(**kw):
-    from types import SimpleNamespace
-
-    base = dict(
-        tensor_parallel_size=1,
-        pipeline_parallel_size=1,
-        data_parallel_size=1,
-        data_parallel_size_local=1,
-        data_parallel_rank=0,
-        nnodes=1,
-        node_rank=0,
-    )
-    base.update(kw)
-    return SimpleNamespace(**base)
-
-
-def test_daemon_places_tp_and_dp_ranks_on_local_gpus():
-    """Each node serves a contiguous global-rank block (DP-major), so without
-    DP local GPU i is TP rank r*local+i, and single-node DP launchers offset
-    by --data-parallel-start-rank."""
+@pytest.mark.parametrize(
+    "placement,expected",
+    [
+        (dict(tensor_parallel_size=8, nnodes=2, node_rank=1), range(4, 8)),
+        (
+            dict(
+                data_parallel_size=16, data_parallel_size_local=4, data_parallel_rank=8
+            ),
+            range(8, 12),
+        ),
+        (
+            dict(
+                tensor_parallel_size=2,
+                data_parallel_size=4,
+                data_parallel_size_local=2,
+                data_parallel_rank=2,
+            ),
+            range(4, 8),
+        ),
+        (dict(tensor_parallel_size=8, data_parallel_size=2, nnodes=2), range(8)),
+        (
+            dict(tensor_parallel_size=8, data_parallel_size=2, nnodes=2, node_rank=1),
+            range(8, 16),
+        ),
+        (
+            dict(tensor_parallel_size=8, data_parallel_size=2, nnodes=4, node_rank=1),
+            range(4, 8),
+        ),
+        (
+            dict(tensor_parallel_size=8, data_parallel_size=2, nnodes=4, node_rank=2),
+            range(8, 12),
+        ),
+        (dict(tensor_parallel_size=4, data_parallel_size=4, nnodes=2), range(8)),
+        (dict(tensor_parallel_size=2, pipeline_parallel_size=2), range(4)),
+    ],
+)
+def test_daemon_places_tp_and_dp_ranks_on_local_gpus(placement, expected):
+    from vllm.config import ParallelConfig
     from vllm.model_executor.model_loader.weight_cache.daemon import plan_local_ranks
 
-    tp_second_node = _parallel(tensor_parallel_size=8, nnodes=2, node_rank=1)
-    assert plan_local_ranks(tp_second_node) == [(i, 0, 0, 4 + i) for i in range(4)]
-
-    dp_third_node = _parallel(
-        data_parallel_size=16, data_parallel_size_local=4, data_parallel_rank=8
-    )
-    assert plan_local_ranks(dp_third_node) == [(i, 8 + i, 0, 0) for i in range(4)]
-
-    dp_tp = _parallel(
-        tensor_parallel_size=2,
-        data_parallel_size=4,
-        data_parallel_size_local=2,
-        data_parallel_rank=2,
-    )
-    assert plan_local_ranks(dp_tp) == [
-        (0, 2, 0, 0),
-        (1, 2, 0, 1),
-        (2, 3, 0, 0),
-        (3, 3, 0, 1),
-    ]
-
-    # DP + nnodes: node-local TP replicas
-    dp_tp_node0 = _parallel(tensor_parallel_size=8, data_parallel_size=2, nnodes=2)
-    assert plan_local_ranks(dp_tp_node0) == [(i, 0, 0, i) for i in range(8)]
-    dp_tp_node1 = _parallel(
-        tensor_parallel_size=8, data_parallel_size=2, nnodes=2, node_rank=1
-    )
-    assert plan_local_ranks(dp_tp_node1) == [(i, 1, 0, i) for i in range(8)]
-
-    # DP + nnodes: TP group spans nodes (TP8 x DP2 on 4 nodes)
-    tp_span_node1 = _parallel(
-        tensor_parallel_size=8, data_parallel_size=2, nnodes=4, node_rank=1
-    )
-    assert plan_local_ranks(tp_span_node1) == [(i, 0, 0, 4 + i) for i in range(4)]
-    tp_span_node2 = _parallel(
-        tensor_parallel_size=8, data_parallel_size=2, nnodes=4, node_rank=2
-    )
-    assert plan_local_ranks(tp_span_node2) == [(i, 1, 0, i) for i in range(4)]
-
-    # DP + nnodes: several DP replicas per node (TP4 x DP4 on 2 nodes)
-    dp_multi_node0 = _parallel(tensor_parallel_size=4, data_parallel_size=4, nnodes=2)
-    assert plan_local_ranks(dp_multi_node0) == [(i, i // 4, 0, i % 4) for i in range(8)]
-
-    # PP adds one daemon placement per stage while preserving TP rank order.
-    pp_tp = _parallel(tensor_parallel_size=2, pipeline_parallel_size=2)
-    assert plan_local_ranks(pp_tp) == [
-        (0, 0, 0, 0),
-        (1, 0, 0, 1),
-        (2, 0, 1, 0),
-        (3, 0, 1, 1),
-    ]
+    config = ParallelConfig(distributed_executor_backend="mp", **placement)
+    assert plan_local_ranks(config) == expected
 
 
-def test_daemon_rejects_unmappable_parallelism():
-    from vllm.model_executor.model_loader.weight_cache.daemon import (
-        _reject_unsupported_parallelism,
-    )
-
-    _reject_unsupported_parallelism(
-        _parallel(
-            data_parallel_size=16, data_parallel_size_local=4, data_parallel_rank=12
-        )
-    )
-    # DP combines with --nnodes when the world size divides evenly.
-    _reject_unsupported_parallelism(
-        _parallel(tensor_parallel_size=4, data_parallel_size=4, nnodes=2)
-    )
-    _reject_unsupported_parallelism(_parallel(pipeline_parallel_size=2))
-    with pytest.raises(ValueError, match="evenly divide"):
-        _reject_unsupported_parallelism(_parallel(tensor_parallel_size=3, nnodes=2))
-    with pytest.raises(ValueError, match="evenly divide"):
-        _reject_unsupported_parallelism(
-            _parallel(tensor_parallel_size=2, data_parallel_size=3, nnodes=4)
-        )
-    with pytest.raises(ValueError, match="exceeds"):
-        _reject_unsupported_parallelism(
-            _parallel(
+@pytest.mark.parametrize(
+    "placement,message",
+    [
+        (dict(tensor_parallel_size=3, nnodes=2), "evenly divide"),
+        (dict(tensor_parallel_size=2, data_parallel_size=3, nnodes=4), "evenly divide"),
+        (
+            dict(
                 data_parallel_size=16, data_parallel_size_local=4, data_parallel_rank=13
-            )
-        )
+            ),
+            "exceeds",
+        ),
+    ],
+)
+def test_daemon_rejects_unmappable_parallelism(placement, message):
+    from vllm.config import ParallelConfig
+    from vllm.model_executor.model_loader.weight_cache.daemon import plan_local_ranks
+
+    config = ParallelConfig(distributed_executor_backend="mp", **placement)
+    with pytest.raises(ValueError, match=message):
+        plan_local_ranks(config)
 
 
 def test_daemon_keys_dense_dp_ranks_like_the_engine():
@@ -1387,38 +1349,40 @@ def test_daemon_keys_dense_dp_ranks_like_the_engine():
     assert get_engine_dp_placement(daemon_config(is_moe=True), dp_rank=3) == (4, 3)
 
 
-def test_daemon_sets_its_rank_like_engine_workers(monkeypatch):
-    """Per-rank state such as the torch.compile cache is keyed by
-    parallel_config.rank, so daemons left at rank 0 would share rank 0's
-    compiled artifact and run every rank's kernels on rank 0's device."""
-    from types import SimpleNamespace
+def test_daemon_sets_its_rank_like_engine_workers(tmp_path):
+    """Each DP replica spans two nodes. Its local DP index starts at zero on each."""
+    from transformers import LlamaConfig
 
-    from vllm.config import AttentionConfig
-    from vllm.model_executor.model_loader.weight_cache import daemon
-
-    monkeypatch.setattr(
-        daemon.WeightCacheKey, "from_model_config", lambda *args, **kwargs: None
+    from vllm.config import ModelConfig, ParallelConfig, VllmConfig
+    from vllm.model_executor.model_loader.weight_cache.daemon import (
+        WeightCacheDaemon,
+        daemon_serves_model,
+        plan_local_ranks,
     )
-    for global_rank in range(4):
-        vllm_config = SimpleNamespace(
-            parallel_config=_parallel(
-                tensor_parallel_size=2,
-                pipeline_parallel_size=2,
-                enable_eplb=False,
-                enable_expert_parallel=False,
-                expert_placement_strategy="linear",
-                rank=0,
-            ),
-            model_config=SimpleNamespace(is_moe=False),
-            cache_config=None,
-            engram_config=None,
-            attention_config=AttentionConfig(),
-            kernel_config=None,
-        )
-        server = daemon.WeightCacheDaemon(
-            vllm_config, global_rank, global_rank, "tcp://127.0.0.1:0"
-        )
-        assert server.vllm_config.parallel_config.rank == global_rank
+
+    LlamaConfig(
+        architectures=["LlamaForCausalLM"], num_hidden_layers=4
+    ).save_pretrained(tmp_path)
+    parallel = ParallelConfig(
+        tensor_parallel_size=1,
+        pipeline_parallel_size=4,
+        data_parallel_size=2,
+        nnodes=4,
+        node_rank=3,
+        distributed_executor_backend="mp",
+    )
+    config = VllmConfig(
+        model_config=ModelConfig(model=str(tmp_path)), parallel_config=parallel
+    )
+    ranks = plan_local_ranks(parallel)
+    assert list(ranks) == [6, 7]
+    for local_rank, global_rank in enumerate(ranks):
+        server = WeightCacheDaemon(config, global_rank, local_rank, "unused")
+        worker = server.vllm_config.parallel_config
+        assert (worker.data_parallel_rank, worker.data_parallel_rank_local) == (1, 0)
+        assert worker.rank == server.cache_key.pp_rank == 2 + local_rank
+        assert server.serves_model
+    assert [rank for rank in ranks if daemon_serves_model(True, rank, parallel)] == [7]
 
 
 def test_weight_cache_key_distinguishes_dp_ranks():
