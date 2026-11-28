@@ -222,9 +222,8 @@ Compiled-cache reuse requires a live D2D source and the same Store
 configuration on source and target. After warmup, the source publishes a
 content-addressed compiled bundle as
 `vllm-warmup-cache/compile_cache/<bundle-sha256>/bundle.tar`. Its authenticated
-D2D response carries the cache manifest, bundle key, byte length and SHA256
-digest, not the bundle itself. The target fetches the bundle from the Store,
-verifies its length and digest, and installs it before model loading. A Store
+D2D response carries the bundle key, byte length and SHA256 digest, not the
+bundle itself. The target fetches the bundle from the Store, verifies its length and digest, and installs it before model loading. A Store
 miss or error, an invalid or incompatible bundle, or a D2D failure falls back
 to local compilation. A Store without a source cannot provide a compiled-cache
 cold start.
