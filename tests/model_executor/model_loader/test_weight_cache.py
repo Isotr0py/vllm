@@ -1377,7 +1377,7 @@ def test_daemon_sets_its_rank_like_engine_workers(tmp_path):
     ranks = plan_local_ranks(parallel)
     assert list(ranks) == [6, 7]
     for local_rank, global_rank in enumerate(ranks):
-        server = WeightCacheDaemon(config, global_rank, local_rank, "unused")
+        server = WeightCacheDaemon(config, global_rank, local_rank)
         worker = server.vllm_config.parallel_config
         assert (worker.data_parallel_rank, worker.data_parallel_rank_local) == (1, 0)
         assert worker.rank == server.cache_key.pp_rank == 2 + local_rank
@@ -1494,11 +1494,13 @@ def test_ipc_rope_matching(
     from transformers import DeepseekV2Config, Qwen3VLConfig
 
     from vllm.config import LoadConfig, ModelConfig
-    from vllm.model_executor.model_loader.weight_cache import daemon, ipc_loader
+    from vllm.model_executor.model_loader.weight_cache import ipc_loader
+    from vllm.model_executor.model_loader.weight_cache.daemon import WeightCacheDaemon
     from vllm.model_executor.model_loader.weight_cache.protocol import (
         CacheConfigMismatchError,
-        WeightCacheKey,
     )
+    from vllm.model_executor.model_loader.weight_cache.server import WeightCacheServer
+    from vllm.model_executor.model_loader.weight_cache.transport import SeedTransport
 
     rope_type, theta, factor, max_position, rank, mismatch = case
     rope = dict(rope_type="yarn", rope_theta=10000, factor=2)
@@ -1517,27 +1519,21 @@ def test_ipc_rope_matching(
         max_model_len=128,
     )
     model_config.hf_text_config.max_position_embeddings = 512
-    server = object.__new__(daemon.WeightCacheDaemon)
     tp_size = 2 if rank else 1
     monkeypatch.setattr(default_vllm_config, "model_config", model_config)
-    monkeypatch.setattr(default_vllm_config.parallel_config, "rank", rank)
     monkeypatch.setattr(
         default_vllm_config.parallel_config, "tensor_parallel_size", tp_size
     )
-    server.cache_key = WeightCacheKey.from_model_config(
-        model_config, tp_size, 0, cache_config=default_vllm_config.cache_config
-    )
+    daemon = WeightCacheDaemon(default_vllm_config, 0, 0)
+    daemon.model = torch.nn.Module()
+    server = WeightCacheServer(daemon.capture_state(), SeedTransport())
+    monkeypatch.setattr(default_vllm_config.parallel_config, "rank", rank)
     model_config.hf_text_config.rope_parameters.update(
         rope_type=rope_type, rope_theta=theta, factor=factor
     )
     model_config.hf_text_config.max_position_embeddings = max_position
-    server.model = torch.nn.Module()
-    server.state, server.backend = _state_for_model(server.model, "torch_ipc")
-    server.backend_name = "torch_ipc"
-    server.role, server.global_rank = "target", 0
-    for module in (daemon, ipc_loader):
-        monkeypatch.setattr(module, "get_current_device_uuid", lambda: "test-device")
     monkeypatch.setattr(torch.accelerator, "current_device_index", lambda: 0)
+    monkeypatch.setattr(current_platform, "get_device_uuid", lambda _: "test-device")
     loader = ipc_loader.IpcModelLoader(LoadConfig(load_format="ipc_cache"))
     loader.fallback = fallback
     loader.state_timeout_s = 5
@@ -1546,7 +1542,7 @@ def test_ipc_rope_matching(
         client.settimeout(5)
         connection.settimeout(5)
         monkeypatch.setattr(loader, "_connect", lambda timeout: client)
-        server_task = executor.submit(server._handle_connection, connection)
+        server_task = executor.submit(server.handle_connection, connection)
         try:
             with (
                 pytest.raises(CacheConfigMismatchError, match=mismatch)
@@ -1583,17 +1579,31 @@ def _serve_one(handler):
     return connect, server_threads
 
 
-def test_ipc_loader_detects_daemon_exit(monkeypatch):
+def test_ipc_loader_detects_daemon_exit(monkeypatch, tmp_path):
     """A zero-copy engine's watch connection closes exactly when the daemon
     that served it exits; watches of exited engines are pruned."""
-    import socket
+    from transformers import LlamaConfig
 
-    from vllm.config import LoadConfig
-    from vllm.model_executor.model_loader.weight_cache import daemon, ipc_loader
+    from vllm.config import LoadConfig, ModelConfig, VllmConfig
+    from vllm.model_executor.model_loader.weight_cache import ipc_loader
+    from vllm.model_executor.model_loader.weight_cache.daemon import WeightCacheDaemon
+    from vllm.model_executor.model_loader.weight_cache.ipc_backends import serial_utils
+    from vllm.model_executor.model_loader.weight_cache.server import WeightCacheServer
+    from vllm.model_executor.model_loader.weight_cache.transport import SeedTransport
 
-    server = object.__new__(daemon.WeightCacheDaemon)
-    server._watchers = []
-    connect, server_threads = _serve_one(server._handle_connection)
+    LlamaConfig(architectures=["LlamaForCausalLM"]).save_pretrained(tmp_path)
+    config = VllmConfig(
+        model_config=ModelConfig(model=str(tmp_path), skip_tokenizer_init=True)
+    )
+    daemon = WeightCacheDaemon(config, 0, 0)
+    daemon.model = torch.nn.Module()
+    server = WeightCacheServer(daemon.capture_state(), SeedTransport())
+    connect, server_threads = _serve_one(server.handle_connection)
+    # The next engine to watch should prune this disconnected one.
+    with connect(5) as client:
+        client.settimeout(5)
+        serial_utils.send_msg(client, {"cmd": "watch"})
+        assert serial_utils.recv_msg(client)["status"] == "ok"
     load_config = LoadConfig(
         load_format="ipc_cache",
         model_loader_extra_config={"socket_path": "/unused/daemon.sock"},
@@ -1613,21 +1623,10 @@ def test_ipc_loader_detects_daemon_exit(monkeypatch):
     assert threads[0].is_alive()
 
     # The daemon exiting closes its end of every watch connection.
-    for watcher in server._watchers:
-        watcher.close()
+    server._close_watchers()
     for thread in threads:
         thread.join(timeout=5)
         assert not thread.is_alive()
-
-    # A watcher whose engine has exited is pruned; a live one is kept.
-    peers = [socket.socketpair() for _ in range(2)]
-    server._watchers = [ours for ours, _ in peers]
-    peers[0][1].close()
-    server._prune_watchers()
-    assert server._watchers == [peers[1][0]]
-    for ours, theirs in peers:
-        ours.close()
-        theirs.close()
 
 
 def test_daemon_capture_releases_registered_model_layers():
@@ -1641,23 +1640,24 @@ def test_daemon_capture_releases_registered_model_layers():
     )
 
     config = VllmConfig(model_config=ModelConfig(model=QWEN_CASE.model))
-    server = WeightCacheDaemon(config, 0, 0, "tcp://127.0.0.1:0")
+    worker = WeightCacheDaemon(config, 0, 0)
     model = torch.nn.Module()
     model.register_parameter("weight", torch.nn.Parameter(torch.arange(4.0)))
-    server.model = model
+    worker.model = model
     config.compilation_config.static_forward_context["model"] = model
     model_ref = weakref.ref(model)
+    worker_ref = weakref.ref(worker)
 
-    server.capture_state()
-    del model
+    shard = worker.capture_state()
+    del worker, model
     gc.collect()
 
     assert model_ref() is None
+    assert worker_ref() is None
     assert not config.compilation_config.static_forward_context
-    assert server.state is not None
     assert torch.equal(
         record_bytes(
-            server.state.storages[0], server.state.manifest["storages"][0]["nbytes"]
+            shard.state.storages[0], shard.state.manifest["storages"][0]["nbytes"]
         ).view(torch.float32),
         torch.arange(4.0),
     )
@@ -1679,7 +1679,7 @@ def test_daemon_releases_cublas_workspaces():
     os.environ["TORCH_CUBLAS_WORKSPACE_CACHE"] = "1"
     config = VllmConfig(model_config=ModelConfig(model=QWEN_CASE.model))
     address = f"tcp://127.0.0.1:{get_open_port()}"
-    server = WeightCacheDaemon(config, 0, 0, address)
+    server = WeightCacheDaemon(config, 0, 0)
     torch.accelerator.set_device_index(0)
     init_distributed_environment(1, 0, address, 0, backend="nccl")
     torch._C._cuda_clearCublasWorkspaces()
@@ -1772,7 +1772,7 @@ def test_ipc_cache_key_tracks_kv_quantization(
         attention_config=AttentionConfig(),
         kernel_config=KernelConfig(),
     )
-    server = daemon.WeightCacheDaemon(config, 0, 0, "unused")
+    server = daemon.WeightCacheDaemon(config, 0, 0)
     config.cache_config = CacheConfig(
         cache_dtype=cache_dtype, kv_cache_dtype_skip_layers=skip_layers
     )
@@ -1859,7 +1859,7 @@ def test_ipc_cache_key_tracks_kernel_backends(
         attention_config=AttentionConfig(),
         kernel_config=KernelConfig(moe_backend="flashinfer_cutlass"),
     )
-    server = daemon.WeightCacheDaemon(config, 0, 0, "unused")
+    server = daemon.WeightCacheDaemon(config, 0, 0)
     config.kernel_config = KernelConfig(**engine_kernel_config)
     monkeypatch.setattr(
         ipc_loader, "check_weight_cache_loader_support", lambda *a, **k: None
@@ -1959,7 +1959,8 @@ def test_warmup_cache_request_validation_and_miss(tmp_path, monkeypatch):
     from vllm.model_executor.model_loader.weight_cache.transport import SeedTransport
 
     def handle(request):
-        transport = SeedTransport([FlashInferWarmupCache()])
+        transport = SeedTransport()
+        transport.publish([FlashInferWarmupCache()])
         return transport.handle_request(request)
 
     assert handle("not a dict")["status"] == "error"
@@ -2021,10 +2022,9 @@ def test_remote_warmup_cache_listener(tmp_path, monkeypatch):
     (cache_dir / "autotune_configs_dp0_rank0.json").write_text(json.dumps(table))
 
     transport = SeedTransport(
-        [FlashInferWarmupCache()],
         SeedConfig(listen=("127.0.0.1", 0), token="test-secret"),
     )
-    address = transport.start_listener()
+    address = transport.publish([FlashInferWarmupCache()])
     assert address is not None
     try:
         cases = [
@@ -2063,8 +2063,8 @@ def test_transport_cuts_off_trickling_peer(monkeypatch):
     )
 
     monkeypatch.setattr(seed_mod, "_REMOTE_REQUEST_TIMEOUT_S", 0.5)
-    transport = SeedTransport([], SeedConfig(listen=("127.0.0.1", 0), token="t"))
-    address = transport.start_listener()
+    transport = SeedTransport(SeedConfig(listen=("127.0.0.1", 0), token="t"))
+    address = transport.publish([])
     assert address is not None
     try:
         with socket.create_connection(address) as idle:
@@ -2175,15 +2175,15 @@ def _exercise_lease_shutdown(
 @create_new_process_for_each_test()
 @pytest.mark.distributed(num_gpus=2)
 def test_d2d_weight_seeding_same_host(vllm_runner, monkeypatch):
-    case = QWEN_MTP_CASE
     """Seed target and draft shards over IPC despite different visible ordinals.
 
     The source sees only physical GPU 1 as ordinal 0. The mirror and the test
     process see both GPUs, so UUID resolution must reopen the source on local
     ordinal 1 while the mirror and engines use physical GPU 0. Graceful source
     shutdown waits for a second, manually driven mover copy and its Unix-socket
-    ack; identical mirror outputs prove every target and draft storage was copied.
+    ack. After the source exits, the mirror serves both an engine and a new peer.
     """
+    case = QWEN_MTP_CASE
     _set_visible_devices(monkeypatch, "0,1")
     monkeypatch.setenv("VLLM_BATCH_INVARIANT", "0")
     _wait_for_previous_engines()
@@ -2246,6 +2246,16 @@ def test_d2d_weight_seeding_same_host(vllm_runner, monkeypatch):
 
             mirror_outputs = generate(
                 vllm_runner, case, mirror.socket_dir, fallback=False
+            )
+            with torch.accelerator.device_index(1):
+                relayed = _exercise_lease_shutdown(
+                    mirror, _daemon_socket(mirror), "peer_ipc"
+                )
+            mirror_uuid = relayed["seed"]["source_gpu_uuid"]
+            assert mirror_uuid == current_platform.get_device_uuid(0)
+            assert (
+                relayed["manifest"]["tensors"].keys()
+                == payload["manifest"]["tensors"].keys()
             )
 
     assert mirror_outputs == baseline_outputs
@@ -2524,7 +2534,7 @@ def test_compile_cache_shared_store_round_trip(tmp_path, monkeypatch):
     target_dir = tmp_path / "target"
     monkeypatch.setenv("FLASHINFER_CUBIN_DIR", str(target_dir))
     target = CompileArtifactWarmupCache(store_names=[store.name])
-    target.install(None, target.validate_payload(payload))
+    target.install(target.validate_payload(payload))
     assert (target_dir / "kernel.cubin").read_bytes() == b"compiled-kernel"
 
 
@@ -2602,7 +2612,7 @@ def test_compile_cache_store_failures_propagate(tmp_path, monkeypatch, failure):
     monkeypatch.setenv("FLASHINFER_CUBIN_DIR", str(target_dir))
     target = CompileArtifactWarmupCache(store_names=[store.name])
     with pytest.raises((RuntimeError, ValueError)):
-        target.install(None, target.validate_payload(payload))
+        target.install(target.validate_payload(payload))
     assert not (target_dir / "kernel.cubin").exists()
 
 
@@ -2782,5 +2792,5 @@ def test_mooncake_store_cross_process_e2e(tmp_path, monkeypatch):
         target_dir = tmp_path / "compiled_target"
         monkeypatch.setenv("FLASHINFER_CUBIN_DIR", str(target_dir))
         target = CompileArtifactWarmupCache(store_names=["mooncake"])
-        target.install(None, target.validate_payload(payload))
+        target.install(target.validate_payload(payload))
         assert (target_dir / "kernel.cubin").read_bytes() == b"compiled-kernel"

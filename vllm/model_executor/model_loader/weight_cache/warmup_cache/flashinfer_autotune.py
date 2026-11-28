@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Any
 import regex as re
 import torch
 
+from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.distributed.parallel_state import get_world_group
 from vllm.logger import init_logger
 from vllm.model_executor.model_loader.weight_cache.artifact_store import (
@@ -18,11 +19,13 @@ from vllm.model_executor.model_loader.weight_cache.artifact_store import (
     DiskArtifactStore,
     artifact_key,
 )
+from vllm.model_executor.model_loader.weight_cache.transport import (
+    Seedable,
+    SeedTransport,
+)
 from vllm.model_executor.model_loader.weight_cache.utils import (
-    build_warmup_runner,
     is_draft_model_cacheable,
 )
-from vllm.model_executor.model_loader.weight_cache.warmup_cache.base import WarmupCache
 from vllm.model_executor.warmup.flashinfer_autotune_cache import (
     flashinfer_autotune_cache_hash,
     flashinfer_autotune_filename,
@@ -33,19 +36,13 @@ from vllm.platforms import current_platform
 from vllm.utils.flashinfer import has_flashinfer
 
 if TYPE_CHECKING:
-    from vllm.model_executor.model_loader.weight_cache.daemon import (
-        WeightCacheDaemon,
-    )
-    from vllm.model_executor.model_loader.weight_cache.transport import (
-        SeedTransport,
-    )
     from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 
 logger = init_logger(__name__)
 _CONFIG_HASH_RE = re.compile(r"[0-9a-f]{64}")
 
 
-class FlashInferWarmupCache(WarmupCache):
+class FlashInferWarmupCache(Seedable):
     """FlashInfer's per-rank autotune table (a single JSON file)."""
 
     kind = "flashinfer_autotune"
@@ -67,8 +64,9 @@ class FlashInferWarmupCache(WarmupCache):
                 self._store_sources.append(STORE_BACKENDS[name]())
         return self._store_sources
 
-    def warmup(self, daemon: "WeightCacheDaemon", transport: "SeedTransport") -> None:
-        vllm_config = daemon.vllm_config
+    def warmup(
+        self, vllm_config: VllmConfig, model: torch.nn.Module, transport: SeedTransport
+    ) -> None:
         # Mirrors the gate in the engine's kernel warmup.
         if (
             vllm_config.kernel_config.enable_flashinfer_autotune is False
@@ -78,27 +76,25 @@ class FlashInferWarmupCache(WarmupCache):
         ):
             return
         from vllm.model_executor.warmup.kernel_warmup import flashinfer_autotune
+        from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 
         try:
             current_platform.update_block_size_for_backend(vllm_config)
-            runner = build_warmup_runner(
-                vllm_config,
-                daemon.device_index,
-                is_draft=daemon.is_draft,
-                model_config=daemon.model_config,
+            device = torch.device(
+                current_platform.device_type, torch.accelerator.current_device_index()
             )
-            assert daemon.model is not None, "warmup ran before load_model"
-            runner.load_model(model=daemon.model)
+            with set_current_vllm_config(vllm_config):
+                runner = GPUModelRunner(vllm_config, device)
+            runner.load_model(model=model)
             # Shared stores come before D2D: they are built for read fan-out.
-            if not self._adopt_from_stores(runner):
-                transport.adopt(self, runner)
+            if not self._adopt_from_stores(runner) and transport.source is not None:
+                self._adopt_from_peer(runner, transport)
             # The runner requires skip_attn when no KV cache exists
             flashinfer_autotune(runner, skip_attn=True)
             logger.info(
-                "Weight cache %s daemon rank %d tuned FlashInfer; the tuned "
+                "Weight cache daemon rank %d tuned FlashInfer; the tuned "
                 "configs are in the on-disk autotune cache",
-                daemon.role,
-                daemon.global_rank,
+                get_world_group().rank_in_group,
             )
             self._publish_autotune_table(runner)
         finally:
@@ -134,6 +130,25 @@ class FlashInferWarmupCache(WarmupCache):
             if (data := store.get(key)) is not None:
                 return {filename: json.loads(data)}
         return None
+
+    def _adopt_from_peer(
+        self, runner: "GPUModelRunner", transport: SeedTransport
+    ) -> None:
+        try:
+            payload = transport.fetch(
+                self.kind, allow_miss=True, **self.request_params(runner)
+            )
+            if payload is None:
+                return
+            self.install(runner, self.validate_payload(payload))
+        except Exception as error:
+            logger.warning(
+                "Could not adopt remote %s seed; using the local cache: %s",
+                self.kind,
+                error,
+            )
+        else:
+            logger.info("Adopted remote %s seed", self.kind)
 
     def _adopt_from_stores(self, runner: "GPUModelRunner") -> bool:
         """Pull this rank's table from the shared stores; True skips D2D."""

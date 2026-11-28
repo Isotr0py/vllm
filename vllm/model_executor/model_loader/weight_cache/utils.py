@@ -15,9 +15,8 @@ from typing import TYPE_CHECKING, Any, Literal
 
 import torch
 
-from vllm.config import SpeculativeConfig, VllmConfig, replace, set_current_vllm_config
+from vllm.config import SpeculativeConfig, VllmConfig
 from vllm.model_executor.models.interfaces import SupportsEagleBase
-from vllm.platforms import current_platform
 from vllm.v1.worker.gpu.spec_decode.eagle.config import EagleSpeculatorConfig
 
 if TYPE_CHECKING:
@@ -27,7 +26,6 @@ if TYPE_CHECKING:
         TensorKind,
     )
     from vllm.model_executor.model_loader.weight_cache.protocol import WeightCacheKey
-    from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 
 
 @dataclass(slots=True)
@@ -158,25 +156,6 @@ def build_weight_cache_key(
         ),
         indexer_kv_dtype=vllm_config.attention_config.indexer_kv_dtype,
     )
-
-
-def build_warmup_runner(
-    vllm_config: VllmConfig,
-    local_rank: int,
-    *,
-    is_draft: bool,
-    model_config: "ModelConfig",
-) -> "GPUModelRunner":
-    """Create a model runner for the daemon's warmup dummy runs."""
-    if is_draft:
-        vllm_config = replace(
-            vllm_config, model_config=model_config, speculative_config=None
-        )
-    device = torch.device(current_platform.device_type, local_rank)
-    with set_current_vllm_config(vllm_config):
-        from vllm.v1.worker.gpu.model_runner import GPUModelRunner
-
-        return GPUModelRunner(vllm_config, device)
 
 
 def collect_tensors(

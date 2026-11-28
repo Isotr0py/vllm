@@ -5,7 +5,7 @@
 import hashlib
 import time
 from collections.abc import Iterable
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 from vllm.logger import init_logger
 from vllm.model_executor.model_loader.weight_cache.artifact_store import (
@@ -13,7 +13,10 @@ from vllm.model_executor.model_loader.weight_cache.artifact_store import (
     ArtifactStore,
     artifact_key,
 )
-from vllm.model_executor.model_loader.weight_cache.warmup_cache.base import WarmupCache
+from vllm.model_executor.model_loader.weight_cache.transport import (
+    Seedable,
+    SeedTransport,
+)
 from vllm.model_executor.model_loader.weight_cache.warmup_cache.common import (
     BUNDLE_LIMIT,
     _bundle,
@@ -22,14 +25,10 @@ from vllm.model_executor.model_loader.weight_cache.warmup_cache.common import (
     _manifest,
 )
 
-if TYPE_CHECKING:
-    from vllm.model_executor.model_loader.weight_cache.daemon import WeightCacheDaemon
-    from vllm.model_executor.model_loader.weight_cache.transport import SeedTransport
-
 logger = init_logger(__name__)
 
 
-class CompileArtifactWarmupCache(WarmupCache):
+class CompileArtifactWarmupCache(Seedable):
     """Compiled runtime cache seeded as part of daemon warmup."""
 
     kind = "compile_cache"
@@ -46,20 +45,16 @@ class CompileArtifactWarmupCache(WarmupCache):
             self._store_sources = [STORE_BACKENDS[name]() for name in self._store_names]
         return self._store_sources
 
-    def adopt_before_load(
-        self, daemon: "WeightCacheDaemon", transport: "SeedTransport"
-    ) -> None:
-        if daemon.seed_config.source is None or not self.store_sources:
+    def adopt_before_load(self, transport: SeedTransport) -> None:
+        if transport.source is None or not self.store_sources:
             return
         deadline = time.monotonic() + 300.0
         while time.monotonic() < deadline:
-            response = transport.request(
-                {"kind": self.kind, **self.request_params(daemon)}
-            )
+            response = transport.request({"kind": self.kind, "version": 1})
             if response is not None and response.get("status") == "ok":
                 try:
                     payload = self.validate_payload(response.get("payload"))
-                    self.install(daemon, payload)
+                    self.install(payload)
                 except Exception as error:
                     logger.warning(
                         "Cannot install remote compile cache; using local loading: %s",
@@ -79,12 +74,6 @@ class CompileArtifactWarmupCache(WarmupCache):
         logger.warning(
             "Timed out waiting for the source compile cache; using local loading"
         )
-
-    def warmup(self, daemon: "WeightCacheDaemon", transport: "SeedTransport") -> None:
-        # Compiler outputs are created by the preceding FlashInfer warmup. A
-        # target already fetched its bundle before model construction.
-        if daemon.seed_config.listen is not None:
-            self.prepare()
 
     def prepare(self) -> None:
         self._payload = None
@@ -111,9 +100,6 @@ class CompileArtifactWarmupCache(WarmupCache):
             "bundle_size": len(bundle),
             "sha256": digest,
         }
-
-    def request_params(self, ctx: Any) -> dict[str, Any]:
-        return {"version": 1}
 
     def resolve(self, request: dict[str, Any]) -> dict[str, Any] | None:
         if request.get("version") != 1:
@@ -149,7 +135,7 @@ class CompileArtifactWarmupCache(WarmupCache):
             "sha256": digest,
         }
 
-    def install(self, ctx: Any, payload: dict[str, Any]) -> None:
+    def install(self, payload: dict[str, Any]) -> None:
         for store in self.store_sources:
             bundle = store.get(payload["key"])
             if bundle is None:

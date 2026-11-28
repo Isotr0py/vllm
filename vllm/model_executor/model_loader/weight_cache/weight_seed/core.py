@@ -21,6 +21,7 @@ if TYPE_CHECKING:
         IPCBackendBase,
         StorageRecord,
     )
+    from vllm.model_executor.model_loader.weight_cache.transport import SeedTransport
 
 SeedBackend = Literal["peer_ipc", "mooncake"]
 
@@ -37,18 +38,9 @@ def parse_seed_backend(value: Any) -> SeedBackend:
     raise ValueError(f"Unknown weight-cache seed backend {value!r}")
 
 
-def acknowledge_lease(transport: Any) -> None:
+def acknowledge_lease(transport: "SeedTransport") -> None:
     """Tell the source that this operation no longer needs its weights."""
-    if transport is None:
-        return
-    response = transport.request({"kind": "weights", "acknowledge": True})
-    if response is None:
-        raise RuntimeError("Could not acknowledge weight-cache copy")
-    if response.get("status") != "ok":
-        raise RuntimeError(
-            f"Source daemon rejected weight-cache acknowledgement: "
-            f"{response.get('message', response)}"
-        )
+    transport.fetch("weights", acknowledge=True)
 
 
 class WeightMover(ABC):

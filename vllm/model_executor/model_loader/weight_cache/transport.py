@@ -2,8 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Daemon-to-daemon seeding over authenticated JSON/TCP or local pickle.
 
-A `Seedable` is one kind of state a daemon can seed to or from a peer
-daemon, including warmup caches and weight shards. The target names what it
+A `Seedable` publishes one kind of state to peers, such as a warmup cache
+or a captured weight shard. The target names what it
 wants by kind and key fields; the source resolves the key to a payload; the
 target validates and installs it:
 
@@ -51,13 +51,9 @@ _AUTHENTICATED_TIMEOUT_S = 300.0
 
 
 class Seedable(Protocol):
-    """One kind of state that can flow between peer daemons, both ways."""
+    """One kind of state a prepared daemon publishes to peers."""
 
     kind: str
-
-    def request_params(self, ctx: Any) -> dict[str, Any]:
-        """Target side: the key fields identifying what this rank needs."""
-        ...
 
     def resolve(self, request: dict[str, Any]) -> Any | None:
         """Source side: produce the payload named by `request`.
@@ -73,14 +69,6 @@ class Seedable(Protocol):
         """Raise ValueError to refuse the request on the remote JSON plane."""
         return None
 
-    def validate_payload(self, payload: Any) -> Any:
-        """Target side: validate the fetched payload, or raise ValueError."""
-        ...
-
-    def install(self, ctx: Any, payload: Any) -> None:
-        """Target side: install a validated payload."""
-        return None
-
 
 class SeedConfig(NamedTuple):
     """A daemon's D2D endpoints and shared token (Unix paths need none)."""
@@ -93,80 +81,44 @@ class SeedConfig(NamedTuple):
 class SeedTransport:
     """The daemon's D2D seeding endpoint: serves and fetches seedables."""
 
-    def __init__(
-        self,
-        seedables: Iterable[Seedable] = (),
-        seed_config: SeedConfig | None = None,
-    ):
+    def __init__(self, seed_config: SeedConfig | None = None):
         seed_config = seed_config or SeedConfig()
         listen, source, token = seed_config
         remote_source = source is not None and not isinstance(source, str)
         if (listen is not None or remote_source) and not token:
             raise ValueError("A daemon-to-daemon listener/source requires a token")
-        self._seedables = list(seedables)
+        self._seedables: dict[str, Seedable] = {}
         self._seed_config = seed_config
         self._server: socket.socket | None = None
 
-    def fetch(self, seedable: Seedable, ctx: Any) -> Any | None:
-        """Fetch and validate a seed payload; None on a miss, else raise."""
-        response = self.request(
-            {"kind": seedable.kind, **seedable.request_params(ctx)},
-        )
+    def fetch(self, kind: str, *, allow_miss: bool = False, **params: Any) -> Any:
+        """Fetch one artifact from our source. Optional caches may return a miss."""
+        response = self.request({"kind": kind, **params})
         if response is None:
-            raise RuntimeError(
-                f"Could not fetch the {seedable.kind} seed from "
-                f"{self._seed_config.source}; the transport logged the reason"
-            )
-        status = response.get("status")
-        if status == "miss":
+            raise RuntimeError(f"Could not fetch {kind} from {self.source}")
+        if allow_miss and response.get("status") == "miss":
             return None
-        if status != "ok":
+        if response.get("status") != "ok":
             raise RuntimeError(
-                f"Source daemon refused the {seedable.kind} seed request "
-                f"(status {status}): {response.get('message', response)}"
+                f"Source daemon refused the {kind} seed request: {response}"
             )
-        return seedable.validate_payload(response.get("payload"))
+        return response.get("payload")
 
     @property
     def source(self) -> str | tuple[str, int] | None:
         """The configured source daemon address, if any."""
         return self._seed_config.source
 
-    def adopt(self, seedable: Seedable, ctx: Any) -> None:
-        """Best-effort: fetch and install `seedable` from the source daemon.
-
-        Any failure degrades to the local path with a log line.
-        """
-        try:
-            payload = self.fetch(seedable, ctx)
-        except Exception as e:
-            logger.warning(
-                "No remote %s seed adopted; using the local path: %s",
-                seedable.kind,
-                e,
-            )
-            return
-        if payload is None:
-            logger.info(
-                "No remote %s seed adopted (miss); using the local path",
-                seedable.kind,
-            )
-            return
-        try:
-            seedable.install(ctx, payload)
-        except Exception as e:
-            logger.warning(
-                "Rejected the remote %s seed; using the local path: %s",
-                seedable.kind,
-                e,
-            )
-            return
-        logger.info("Adopted remote %s seed", seedable.kind)
+    @property
+    def listens(self) -> bool:
+        return self._seed_config.listen is not None
 
     def handle_request(self, request: Any, *, remote: bool = False) -> dict[str, Any]:
         """Source side: answer one request; remote=True applies validate_remote."""
         kind_name = request.get("kind") if isinstance(request, dict) else None
-        seedable = next((s for s in self._seedables if s.kind == kind_name), None)
+        seedable = (
+            self._seedables.get(kind_name) if isinstance(kind_name, str) else None
+        )
         if seedable is None:
             return {"status": "error", "message": "unsupported seed kind"}
         try:
@@ -223,17 +175,19 @@ class SeedTransport:
             send_msg(sock, {"cmd": "seed", **payload})
             return recv_msg(sock)
 
-    def start_listener(self) -> tuple[str, int] | None:
-        """Serve this rank's seedables to peers; None when unconfigured."""
+    def publish(self, seedables: Iterable[Seedable]) -> tuple[str, int] | None:
+        """Publish the prepared artifacts for local requests and optional TCP peers."""
+        if self._server is not None:
+            return self._server.getsockname()[:2]
+        self._seedables = {seed.kind: seed for seed in seedables}
         listen = self._seed_config.listen
         if listen is None:
             return None
-        if self._server is not None:
-            return self._server.getsockname()[:2]
         family = socket.AF_INET6 if ":" in listen[0] else socket.AF_INET
         self._server = socket.create_server(listen, family=family)
         threading.Thread(
             target=self._serve,
+            args=(self._server,),
             name="vllm-weight-cache-d2d",
             daemon=True,
         ).start()
@@ -245,10 +199,7 @@ class SeedTransport:
             self._server.close()
             self._server = None
 
-    def _serve(self) -> None:
-        assert self._server is not None
-        # Bound once: close() nils self._server out from under the accept loop.
-        server = self._server
+    def _serve(self, server: socket.socket) -> None:
         while True:
             try:
                 conn, _ = server.accept()

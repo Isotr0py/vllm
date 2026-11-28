@@ -1,47 +1,53 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""The weights seedable: a daemon both serves and fetches its shard."""
+"""Publish one prepared weight shard and track its outstanding peer copies."""
 
-import contextlib
 import threading
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from typing import TYPE_CHECKING, Any
 
 from vllm.logger import init_logger
 from vllm.model_executor.model_loader.weight_cache.transport import Seedable
 from vllm.model_executor.model_loader.weight_cache.weight_seed.core import (
-    MOONCAKE_BACKEND,
     PEER_IPC_BACKEND,
     SeedBackend,
     WeightMover,
-    acknowledge_lease,
     get_mover,
     parse_seed_backend,
 )
 from vllm.model_executor.model_loader.weight_cache.weight_seed.utils import (
     WeightsSeedPayload,
-    validate_weights_payload,
 )
 
 if TYPE_CHECKING:
-    from vllm.model_executor.model_loader.weight_cache.daemon import (
-        WeightCacheDaemon,
+    from vllm.model_executor.model_loader.weight_cache.ipc_backends.base import (
+        IPCBackendBase,
     )
+    from vllm.model_executor.model_loader.weight_cache.protocol import (
+        WeightCacheKey,
+        WeightCacheState,
+    )
+
 
 logger = init_logger(__name__)
 
 WEIGHT_COPY_LEASE_TIMEOUT_S = 300.0
 
 
+@dataclass(eq=False, kw_only=True)
 class WeightShardSeed(Seedable):
-    """This daemon's weight shard: served to and fetched from peer daemons."""
+    """A resident shard shared by engine attachment and peer seeding."""
 
     kind = "weights"
+    state: "WeightCacheState"
+    cache_key: "WeightCacheKey"
+    model_name: str
+    backend: "IPCBackendBase"
+    backend_name: str
+    device_index: int
+    global_rank: int
 
-    def __init__(self, daemon: "WeightCacheDaemon"):
-        # The daemon this rank serves and fetches for: the manifest, mover
-        # seeds and fingerprint are all read from it.
-        self._daemon = daemon
+    def __post_init__(self) -> None:
         self._movers: dict[SeedBackend, WeightMover] = {}
         self._active_copies = 0
         self._lease_lock = threading.Lock()
@@ -57,8 +63,8 @@ class WeightShardSeed(Seedable):
         if mover is None:
             mover = get_mover(
                 backend,
-                device_index=self._daemon.device_index,
-                ipc_backend=self._daemon.backend,
+                device_index=self.device_index,
+                ipc_backend=self.backend,
             )
             self._movers[backend] = mover
         return mover
@@ -68,10 +74,9 @@ class WeightShardSeed(Seedable):
             self._release_pending = True
             if self._active_copies:
                 logger.info(
-                    "Weight cache %s daemon rank %d waiting for %d "
+                    "Weight cache daemon rank %d waiting for %d "
                     "weight-cache copy acknowledgement(s)",
-                    self._daemon.role,
-                    self._daemon.global_rank,
+                    self.global_rank,
                     self._active_copies,
                 )
 
@@ -110,41 +115,21 @@ class WeightShardSeed(Seedable):
         """Describe this rank so a peer daemon can mirror it."""
         if request.get("acknowledge"):
             return self._acknowledge()
-        daemon = self._daemon
         backend = parse_seed_backend(request.get("seed_backend", PEER_IPC_BACKEND))
         with self._lease_lock:
             if self._release_pending:
                 raise ValueError("Weights are being released")
             mover = self._mover(backend)
-            state = daemon.state
-            assert state is not None
+            state = self.state
             seed = mover.prepare_seed(state.storages)
             self._active_copies += 1
             return {
-                "cache_config": asdict(daemon.cache_key),
+                "cache_config": asdict(self.cache_key),
                 # Matched instead of the checkpoint fingerprint by a mirror
                 # without the safetensors to hash (see seed_mismatches).
-                "model": daemon.model_config.model,
+                "model": self.model_name,
                 "manifest": state.manifest,
                 "aliases": state.aliases,
                 "attrs": state.attrs,
                 "seed": seed,
             }
-
-    def request_params(self, ctx: Any) -> dict[str, Any]:
-        """Ask this daemon's source for the shard, over the fitting mover."""
-        source = self._daemon.d2d.source
-        backend = PEER_IPC_BACKEND if isinstance(source, str) else MOONCAKE_BACKEND
-        return {"seed_backend": backend}
-
-    def validate_payload(self, payload: Any) -> WeightsSeedPayload:
-        """Structural checks plus the shard fingerprint against this daemon."""
-        daemon = self._daemon
-        try:
-            return validate_weights_payload(
-                payload, daemon.cache_key, daemon.model_config.model
-            )
-        except Exception:
-            with contextlib.suppress(Exception):
-                acknowledge_lease(daemon.d2d)
-            raise
