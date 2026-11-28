@@ -5,11 +5,12 @@ import os
 import signal
 import subprocess
 import time
-from argparse import ArgumentError, ArgumentParser
+from argparse import ArgumentParser
+from functools import cached_property
 from types import TracebackType
 from typing import BinaryIO, Self
 
-import requests
+import httpx
 
 from vllm.utils.network_utils import join_host_port
 
@@ -27,14 +28,18 @@ class ServerProcess:
         after_bench_cmd: list[str],
         *,
         show_stdout: bool,
-        session: requests.Session | None = None,
+        http_client: httpx.Client | None = None,
+        server_address: str | None = None,
+        ready_url: str | None = None,
     ) -> None:
         super().__init__()
 
         self.server_cmd = server_cmd
         self.after_bench_cmd = after_bench_cmd
         self.show_stdout = show_stdout
-        self.http = session or requests
+        self.http = http_client or httpx
+        self._server_address = server_address
+        self._ready_url = ready_url
         self._stopped = True
 
     def __enter__(self) -> Self:
@@ -74,27 +79,21 @@ class ServerProcess:
         """Return True if this call had to force shutdown."""
         if self._stopped:
             return False
-        if grace_period is None:
-            self._kill_group()
-            return True
-
+        process = self._server_process
+        forced = grace_period is None
         try:
-            with contextlib.suppress(OSError):
-                self._server_process.terminate()
-            self._server_process.wait(timeout=grace_period)
+            if grace_period is not None:
+                process.terminate()
+                process.wait(timeout=grace_period)
         except subprocess.TimeoutExpired:
-            return True
+            forced = True
         finally:
-            self._kill_group(timeout=10)
-        return False
-
-    def _kill_group(self, timeout: float | None = None) -> None:
-        server_process = self._server_process
-        # start_new_session makes the server PID the PGID, even after it exits.
-        with contextlib.suppress(OSError):
-            os.killpg(server_process.pid, signal.SIGKILL)
-        server_process.wait(timeout=timeout)
-        self._stopped = True
+            # Workers can outlive the group leader.
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(process.pid, signal.SIGKILL)
+            process.wait()
+            self._stopped = True
+        return forced
 
     def run_subcommand(self, cmd: list[str]):
         return subprocess.run(
@@ -110,28 +109,33 @@ class ServerProcess:
 
         self.run_subcommand(self.after_bench_cmd)
 
-    def _get_vllm_server_address(self) -> str:
-        parser = ArgumentParser(add_help=False, allow_abbrev=False, exit_on_error=False)
+    @cached_property
+    def server_address(self) -> str:
+        if self._server_address:
+            return self._server_address
+        parser = ArgumentParser(add_help=False, allow_abbrev=False)
         parser.add_argument("--host", default="localhost")
         parser.add_argument("-p", "--port", type=int, default=8000)
-        try:
-            args, _ = parser.parse_known_args(self.server_cmd)
-        except ArgumentError as exc:
-            raise ValueError(str(exc)) from exc
+        args, _ = parser.parse_known_args(self.server_cmd)
         return "http://" + join_host_port(args.host, args.port)
 
     @property
-    def server_address(self) -> str:
-        return self._get_vllm_server_address()
+    def ready_url(self) -> str:
+        return self._ready_url or f"{self.server_address}/health"
 
     def is_server_ready(self, timeout: float | None = None) -> bool:
         try:
-            with self.http.get(
-                f"{self.server_address}/health", timeout=timeout, stream=True
+            with self.http.stream(
+                "GET", self.ready_url, timeout=timeout, follow_redirects=True
             ) as response:
                 return response.status_code == 200
-        except requests.RequestException:
+        except httpx.RequestError:
             return False
+
+    def check_alive(self) -> None:
+        returncode = self._server_process.poll()
+        if returncode is not None:
+            raise RuntimeError(f"Server process exited with return code {returncode}")
 
     def wait_until_ready(
         self,
@@ -142,12 +146,7 @@ class ServerProcess:
     ) -> None:
         start_time = time.monotonic()
         while not self.is_server_ready(timeout=request_timeout):
-            # Check if server process has crashed
-            if self._server_process.poll() is not None:
-                returncode = self._server_process.returncode
-                raise RuntimeError(
-                    f"Server process crashed with return code {returncode}"
-                )
+            self.check_alive()
             if time.monotonic() - start_time > timeout:
                 raise TimeoutError(
                     f"Server failed to become ready within {timeout} seconds."
@@ -163,7 +162,9 @@ class ServerProcess:
             print(f"Resetting caches at {server_address}")
 
             for endpoint in self.VLLM_RESET_CACHE_ENDPOINTS:
-                res = requests.post(server_address + endpoint)
+                res = self.http.post(
+                    server_address + endpoint, timeout=None, follow_redirects=True
+                )
                 res.raise_for_status()
         elif server_cmd[0].endswith("infinity_emb"):
             if "--vector-disk-cache" in server_cmd:
