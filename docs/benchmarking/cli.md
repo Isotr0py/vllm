@@ -1669,49 +1669,25 @@ throughput numbers correctly is also adjusted.
 
 ## Startup Benchmark
 
-By default, `vllm bench startup` times engine construction. To measure how
-long a new server takes to answer its first request, pass the full server
-command, including its engine arguments, to `--serve-cmd`.
+By default, `vllm bench startup` times engine construction. To measure how long a new server takes to answer its first request, pass the full server command, including its engine arguments, to `--serve-cmd`.
 
 ```bash
-vllm bench startup --serve-cmd 'vllm serve Qwen/Qwen3-0.6B --port 8100' \
-  --num-iters-cold 1 --num-iters-warmup 1 --num-iters-warm 3 \
-  --output-json startup.json
+vllm bench startup --serve-cmd 'vllm serve Qwen/Qwen3-0.6B --port 8100' --num-iters-cold 1 --num-iters-warmup 1 --num-iters-warm 3 --output-json startup.json
 ```
 
-Each iteration launches a fresh server on the specified address, which must
-be idle. Both clocks start at launch. One stops at the first successful
-`/health` poll, the other at the first non-empty text in a streamed completion.
-The request ends at the first non-empty text. A failed launch or request
-stops the benchmark and reports the error. The benchmark cleans up the
-processes it started.
+Each iteration launches a fresh server on the specified address, which must be idle. Both clocks start at launch. One stops at the first successful `/health` poll, the other at the first non-empty text in a streamed completion. The request ends at the first non-empty text. A failed launch or request stops the benchmark and reports the error. The benchmark cleans up the processes it started.
 
-Cold starts use empty `VLLM_CACHE_ROOT`, TorchInductor and Triton caches.
-Other libraries' caches follow the environment. Without a sidecar, warmup and
-warm starts reuse the caller's caches. The default readiness timeout is 1800
-seconds. With `--output-json`, each iteration
-records the path to its server log. Otherwise the server writes to the terminal.
+Cold starts use empty `VLLM_CACHE_ROOT`, TorchInductor and Triton caches. Other libraries' caches follow the environment. Without a sidecar, warmup and warm starts reuse the caller's caches. The default readiness timeout is 1800 seconds. With `--output-json`, each iteration records the path to its server log. Otherwise the server writes to the terminal.
 
 ### Starting a long-running process before the server
 
-Use `--pre-serve-cmd` to start a companion process in each cold iteration.
-By default the benchmark times the companion until its health endpoint is ready.
-Warmup and warm iterations then launch fresh servers against the last companion.
-For example, to time preload followed by two server starts against resident
-weights, run
+Use `--pre-serve-cmd` to start a companion process in each cold iteration. By default the benchmark times the companion until its health endpoint is ready. Warmup and warm iterations then launch fresh servers against the last companion. For example, to time preload followed by two server starts against resident weights, run
 
 ```bash
-vllm bench startup \
-  --pre-serve-cmd 'vllm preload --model Qwen/Qwen3-0.6B' \
-  --serve-cmd 'vllm serve Qwen/Qwen3-0.6B --load-format ipc_cache' \
-  --num-iters-cold 1 --num-iters-warmup 0 --num-iters-warm 2 \
-  --output-json startup.json
+vllm bench startup --pre-serve-cmd 'vllm preload --model Qwen/Qwen3-0.6B' --serve-cmd 'vllm serve Qwen/Qwen3-0.6B --load-format ipc_cache' --num-iters-cold 1 --num-iters-warmup 0 --num-iters-warm 2 --output-json startup.json
 ```
 
-Add `--async-serve` to also launch a server in each cold iteration, immediately
-after the companion. Both processes use the same fresh cache directories. Their
-health probes run independently, and the first request starts as soon as the
-server is ready.
+Add `--async-serve` to also launch a server in each cold iteration, immediately after the companion. Both processes use the same fresh cache directories. Their health probes run independently, and the first request starts as soon as the server is ready.
 
 | JSON metric (seconds) | Clock starts | Clock stops |
 | --- | --- | --- |
@@ -1720,18 +1696,6 @@ server is ready.
 | `concurrent_first_token_times` | Sidecar launch | First non-empty completion text |
 | `warm_ready_times`, `warm_first_token_times` | Server restart | Server health check or first non-empty text, respectively |
 
-Each `concurrent_iterations` row also records `serve_launch_offset`, the delay in
-seconds between the two launches. These rows and the `concurrent_*` metrics are
-produced by `--async-serve`. In either mode, the final sidecar stays up through
-all warmup and warm iterations, which reuse its cache directories. With zero
-cold iterations, the benchmark waits for one setup sidecar using the caller's
-caches before starting any warmup or warm servers.
+Each `concurrent_iterations` row also records `serve_launch_offset`, the delay in seconds between the two launches. These rows and the `concurrent_*` metrics are produced by `--async-serve`. In either mode, the final sidecar stays up through all warmup and warm iterations, which reuse its cache directories. With zero cold iterations, the benchmark waits for one setup sidecar using the caller's caches before starting any warmup or warm servers.
 
-For `vllm preload`, use matching models, GPU placement and parallelism.
-The example shows the loader explicitly. The benchmark also adds
-`--load-format ipc_cache` if omitted, configures a private IPC socket directory
-and a daemon health port, and disables disk fallback. The IPC wait
-defaults to `--server-ready-timeout` unless the serve command supplies
-`state_timeout_s`. For any other sidecar, pass its readiness endpoint with
-`--pre-serve-ready-url` (for example, `http://127.0.0.1:9000/ready`).
-With an explicit URL the benchmark runs both commands exactly as supplied.
+For `vllm preload`, use matching models, GPU placement and parallelism. The example shows the loader explicitly. The benchmark also adds `--load-format ipc_cache` if omitted, configures a private IPC socket directory and a daemon health port, and disables disk fallback. The IPC wait defaults to `--server-ready-timeout` unless the serve command supplies `state_timeout_s`. For any other sidecar, pass its readiness endpoint with `--pre-serve-ready-url` (for example, `http://127.0.0.1:9000/ready`). With an explicit URL the benchmark runs both commands exactly as supplied.
