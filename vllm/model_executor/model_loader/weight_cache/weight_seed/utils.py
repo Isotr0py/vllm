@@ -2,15 +2,13 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Helpers for weight shard seeding (manifest format, fingerprint, launcher logic)."""
 
-import socket
 from collections.abc import Mapping
 from dataclasses import fields
-from typing import TYPE_CHECKING, Any, TypedDict, cast
+from typing import Any, TypedDict, cast
 
 import torch
 from pydantic import TypeAdapter
 
-from vllm.config import replace
 from vllm.model_executor.model_loader.weight_cache.ipc_backends.base import (
     TensorKind,
 )
@@ -20,13 +18,10 @@ from vllm.model_executor.model_loader.weight_cache.ipc_backends.serial_utils imp
 )
 from vllm.model_executor.model_loader.weight_cache.protocol import (
     WeightCacheKey,
+    connect_local_socket,
     parse_seed_address,
-    verify_socket_owner,
 )
 from vllm.platforms import current_platform
-
-if TYPE_CHECKING:
-    from vllm.config import VllmConfig
 
 _CONNECT_TIMEOUT_S = 5.0
 
@@ -176,30 +171,13 @@ def seed_address(
     return host, port + port_offset + global_rank
 
 
-def peer_cache_config(config: "VllmConfig", *, is_draft: bool) -> "VllmConfig":
-    """Switch one daemon's config to the `peer_cache` load format."""
-    extra = dict(config.load_config.model_loader_extra_config or {})
-    extra["is_draft"] = is_draft
-    return replace(
-        config,
-        load_config=replace(
-            config.load_config,
-            load_format="peer_cache",
-            model_loader_extra_config=extra,
-        ),
-    )
-
-
 def mirror_device_indices(addresses: list[SeedAddress], num_local: int) -> list[int]:
     """A same-host mirror's GPU indices: the free ones past the source's."""
     source_uuids = set()
     for path in addresses:
         # The launcher only calls this for the all-Unix-socket form.
         assert isinstance(path, str)
-        verify_socket_owner(path, strict_perms=False)
-        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
-            sock.settimeout(_CONNECT_TIMEOUT_S)
-            sock.connect(path)
+        with connect_local_socket(path, _CONNECT_TIMEOUT_S) as sock:
             send_msg(sock, {"cmd": "get_memory"})
             response = recv_msg(sock)
         gpu_uuid = response.get("gpu_uuid") if isinstance(response, dict) else None

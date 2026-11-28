@@ -48,8 +48,7 @@ vllm serve meta-llama/Llama-3.1-8B-Instruct \
 ```
 
 The daemon itself must load from disk (or seed from a peer replica, see
-below); passing `--load-format ipc_cache` or `peer_cache` to `vllm preload`
-is an error.
+below); passing `--load-format ipc_cache` to `vllm preload` is an error.
 
 ## Local sharing backends
 

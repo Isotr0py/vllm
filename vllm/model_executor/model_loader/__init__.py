@@ -28,9 +28,6 @@ from vllm.model_executor.model_loader.utils import (
     get_model_cls,
 )
 from vllm.model_executor.model_loader.weight_cache.ipc_loader import IpcModelLoader
-from vllm.model_executor.model_loader.weight_cache.weight_seed.loader import (
-    PeerModelLoader,
-)
 
 logger = init_logger(__name__)
 
@@ -46,7 +43,6 @@ LoadFormats = Literal[
     "mistral",
     "modelexpress",
     "npcache",
-    "peer_cache",
     "pt",
     "runai_streamer",
     "runai_streamer_sharded",
@@ -64,7 +60,6 @@ _LOAD_FORMAT_TO_MODEL_LOADER: dict[str, type[BaseModelLoader]] = {
     "mistral": DefaultModelLoader,
     "modelexpress": ModelExpressModelLoader,
     "npcache": DefaultModelLoader,
-    "peer_cache": PeerModelLoader,
     "pt": DefaultModelLoader,
     "runai_streamer": RunaiModelStreamerLoader,
     "runai_streamer_sharded": ShardedStateLoader,
@@ -170,7 +165,6 @@ __all__ = [
     "DefaultModelLoader",
     "DummyModelLoader",
     "IpcModelLoader",
-    "PeerModelLoader",
     "RunaiModelStreamerLoader",
     "ShardedStateLoader",
     "TensorizerLoader",

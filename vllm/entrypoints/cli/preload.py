@@ -49,7 +49,6 @@ from vllm.model_executor.model_loader.weight_cache.weight_seed.utils import (
     SeedAddress,
     mirror_device_indices,
     parse_seed_addresses,
-    peer_cache_config,
     seed_address,
 )
 from vllm.usage.usage_lib import UsageContext
@@ -315,12 +314,11 @@ class PreloadSubcommand(CLISubcommand):
             else None
         )
         vllm_config = engine_args.create_engine_config(usage_context=usage_context)
-        load_format = vllm_config.load_config.load_format
-        if load_format in ("ipc_cache", "peer_cache"):
+        if vllm_config.load_config.load_format == "ipc_cache":
             raise ValueError(
-                f"--load-format {load_format} is not accepted here: the "
-                "weight cache daemon loads from disk by default, and "
-                "--weight-cache-seed switches it to peer_cache internally"
+                "--load-format ipc_cache is not accepted here: the weight "
+                "cache daemon loads from disk by default, or from a peer "
+                "replica with --weight-cache-seed"
             )
         # Config-only so it can fail before any model loading; the quant
         # method check needs the created model and runs in
@@ -442,7 +440,7 @@ class PreloadSubcommand(CLISubcommand):
             for local_rank, dp_rank, pp_rank, tp_rank in placements:
                 global_rank = dp_rank * pp_size * tp_size + pp_rank * tp_size + tp_rank
                 offset = port_offset + global_rank
-                peer_source = seed_address(
+                source = seed_address(
                     seed_addresses,
                     local_rank,
                     global_rank,
@@ -450,15 +448,7 @@ class PreloadSubcommand(CLISubcommand):
                     node_rank=node_rank,
                     is_draft=is_draft,
                 )
-                source: str | tuple[str, int] | None
-                if peer_source is not None:
-                    daemon_config = peer_cache_config(config, is_draft=is_draft)
-                    # The mirror also adopts the source's warmup caches (the
-                    # FlashInfer autotune table) from the same address
-                    # through the ordinary warmup-cache seeding path.
-                    source = peer_source
-                else:
-                    daemon_config = config
+                if source is None:
                     source = _seed_endpoint(
                         args.seed_source_host, args.seed_source_port, offset
                     )
@@ -468,6 +458,7 @@ class PreloadSubcommand(CLISubcommand):
                     ),
                     source=source,
                     token=args.seed_token,
+                    seed_weights=bool(seed_addresses),
                 )
                 procs.append(
                     ctx.Process(
@@ -475,7 +466,7 @@ class PreloadSubcommand(CLISubcommand):
                         args=(
                             global_rank,
                             local_rank,
-                            daemon_config,
+                            config,
                             init_method,
                             args.weight_cache_socket_dir,
                             ready_queue,

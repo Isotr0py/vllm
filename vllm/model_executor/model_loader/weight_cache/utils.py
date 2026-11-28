@@ -98,11 +98,6 @@ def format_daemon_role(is_draft: bool) -> DaemonRole:
     return "draft" if is_draft else "target"
 
 
-def format_socket_role_suffix(is_draft: bool) -> str:
-    """Socket-name suffix keeping the draft group distinct from the target."""
-    return "_draft" if is_draft else ""
-
-
 def get_engine_dp_placement(vllm_config: VllmConfig, dp_rank: int) -> tuple[int, int]:
     """`(dp_size, dp_rank)` as the engine fingerprints this DP rank.
 

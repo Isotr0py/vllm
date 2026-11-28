@@ -152,7 +152,7 @@ from vllm.model_executor.model_loader.weight_cache.warmup_cache.flashinfer_autot
     FlashInferWarmupCache,
 )
 from vllm.model_executor.model_loader.weight_cache.weight_seed.loader import (
-    PeerModelLoader,
+    load_peer_model,
 )
 from vllm.model_executor.model_loader.weight_cache.weight_seed.seed import (
     WEIGHT_COPY_LEASE_TIMEOUT_S,
@@ -373,7 +373,6 @@ class WeightCacheDaemon:
         vllm_config = self.vllm_config
         model_config = self.model_config
         load_config = vllm_config.load_config
-        loader = get_model_loader(load_config)
         device_config = vllm_config.device_config
         target_device = torch.device(
             device_config.device if load_config.device is None else load_config.device
@@ -381,16 +380,21 @@ class WeightCacheDaemon:
         # Attention backends may take workspace at construction, like in the
         # engine's worker init.
         init_workspace_manager(target_device)
-        if isinstance(loader, PeerModelLoader):
+        if self.d2d.seeds_weights:
             # The daemon is both ends of the weights kind: it fetches this
             # rank's shard from its source over its own D2D endpoint, and
-            # the loader installs the payload into a model.
+            # load_peer_model installs the payload into a model.
             payload = self.d2d.fetch(self.weight_seed, self)
             # The weights kind answers a payload or an error, never a miss.
             assert payload is not None
-            return loader.load_model(
-                vllm_config, model_config, payload=payload, transport=self.d2d
+            return load_peer_model(
+                vllm_config,
+                model_config,
+                is_draft=self.is_draft,
+                payload=payload,
+                transport=self.d2d,
             )
+        loader = get_model_loader(load_config)
         with set_default_torch_dtype(model_config.dtype):
             with target_device:
                 model = loader.create_model(vllm_config, model_config)
