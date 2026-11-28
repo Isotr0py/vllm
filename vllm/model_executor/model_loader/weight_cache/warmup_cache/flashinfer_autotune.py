@@ -157,7 +157,7 @@ class FlashInferWarmupCache(Seedable):
             return False
         key, filename = self._runner_key(runner)
         if self.store_sources[0].get(key) is not None:
-            return False
+            return True
         for store in shared:
             if (data := store.get(key)) is not None:
                 break
@@ -175,13 +175,14 @@ class FlashInferWarmupCache(Seedable):
         return True
 
     def _publish_autotune_table(self, runner: "GPUModelRunner") -> None:
-        """Publish this rank's tuned table from the disk store to every store."""
-        if len(self.store_sources) == 1:
+        """Publish this rank's tuned table from the disk store to shared stores."""
+        shared = self.store_sources[1:]
+        if not shared:
             return
         key, _ = self._runner_key(runner)
         if (data := self.store_sources[0].get(key)) is None:
             return
-        for store in self.store_sources:
+        for store in shared:
             store.put(key, data)
         logger.info("Published the FlashInfer autotune table: %s", key)
 

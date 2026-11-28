@@ -19,6 +19,7 @@ import stat
 import struct
 import tempfile
 from dataclasses import dataclass, fields
+from pathlib import Path
 from typing import Any, NamedTuple
 
 import torch
@@ -34,9 +35,6 @@ from vllm.model_executor.model_loader.weight_cache.ipc_backends.base import (
 from vllm.model_executor.model_loader.weight_cache.ipc_backends.serial_utils import (
     _LEN_STRUCT,
     _recv_exact,
-)
-from vllm.model_executor.model_loader.weight_cache.utils import (
-    format_socket_role_suffix,
 )
 from vllm.model_executor.model_loader.weight_utils import (
     filter_duplicate_safetensors_files,
@@ -172,7 +170,7 @@ def get_socket_path(
     gpu_id = safe_hash(gpu_uuid.encode()).hexdigest()
     name = SOCKET_NAME_TEMPLATE.format(
         gpu_uuid=gpu_id,
-        role=format_socket_role_suffix(is_draft),
+        role="_draft" if is_draft else "",
     )
     return os.path.join(get_socket_dir(socket_dir), name)
 
@@ -233,6 +231,32 @@ def verify_socket_owner(socket_path: str, strict_perms: bool = True) -> None:
         raise WeightCacheUnavailableError(
             f"Socket {socket_path} is not owned by the current user"
         )
+
+
+def connect_local_socket(
+    socket_path: str | Path,
+    timeout: float,
+    *,
+    strict_perms: bool = False,
+) -> socket.socket:
+    """Verify socket ownership and connect to a local Unix domain socket."""
+    path = os.fspath(socket_path)
+    try:
+        verify_socket_owner(path, strict_perms=strict_perms)
+    except OSError as e:
+        raise WeightCacheUnavailableError(
+            f"Weight cache socket {path} is unavailable: {e}"
+        ) from e
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    sock.settimeout(timeout)
+    try:
+        sock.connect(path)
+    except OSError as e:
+        sock.close()
+        raise WeightCacheUnavailableError(
+            f"Cannot connect to weight cache daemon at {path}: {e}"
+        ) from e
+    return sock
 
 
 def verify_peer_is_owner(conn: socket.socket) -> None:

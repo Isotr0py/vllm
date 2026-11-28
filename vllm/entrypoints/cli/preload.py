@@ -48,7 +48,6 @@ from vllm.model_executor.model_loader.weight_cache.weight_seed.utils import (
     SeedAddress,
     mirror_device_indices,
     parse_seed_addresses,
-    peer_cache_config,
     seed_address,
 )
 from vllm.usage.usage_lib import UsageContext
@@ -130,6 +129,8 @@ def _validate_seed_args(
         raise ValueError(
             "--weight-cache-seed conflicts with --seed-source-host/--seed-source-port"
         )
+    if args.weight_cache_seed is not None and not addresses:
+        raise ValueError("--weight-cache-seed must specify at least one address")
     unix_seed = any(isinstance(address, str) for address in addresses)
     remote_seed = any(not isinstance(address, str) for address in addresses)
     if unix_seed and remote_seed:
@@ -311,12 +312,11 @@ class PreloadSubcommand(CLISubcommand):
             else None
         )
         vllm_config = engine_args.create_engine_config(usage_context=usage_context)
-        load_format = vllm_config.load_config.load_format
-        if load_format in ("ipc_cache", "peer_cache"):
+        if vllm_config.load_config.load_format == "ipc_cache":
             raise ValueError(
-                f"--load-format {load_format} is not accepted here: the "
-                "weight cache daemon loads from disk by default, and "
-                "--weight-cache-seed switches it to peer_cache internally"
+                "--load-format ipc_cache is not accepted here: the weight "
+                "cache daemon loads from disk by default, or from a peer "
+                "replica with --weight-cache-seed"
             )
         # Config-only so it can fail before any model loading; the quant
         # method check needs the created model and runs in
@@ -336,10 +336,16 @@ class PreloadSubcommand(CLISubcommand):
         if dp_size > 1:
             master_addr = parallel_config.data_parallel_master_ip
             if nnodes == 1:
-                nnodes = dp_size // parallel_config.data_parallel_size_local
-                node_rank = parallel_config.data_parallel_rank // (
-                    parallel_config.data_parallel_size_local
-                )
+                local_dp = parallel_config.data_parallel_size_local
+                first_dp = parallel_config.data_parallel_rank
+                if dp_size % local_dp != 0 or first_dp % local_dp != 0:
+                    raise ValueError(
+                        f"--data-parallel-size-local ({local_dp}) must evenly divide "
+                        f"--data-parallel-size ({dp_size}) and "
+                        f"--data-parallel-start-rank ({first_dp})"
+                    )
+                nnodes = dp_size // local_dp
+                node_rank = first_dp // local_dp
             if nnodes > 1 and master_addr in ("127.0.0.1", "localhost"):
                 raise ValueError(
                     "Data parallelism across nodes requires a reachable "
@@ -420,8 +426,6 @@ class PreloadSubcommand(CLISubcommand):
             # source node.
             port_offset = group_index * world_size
             role = format_daemon_role(is_draft)
-            if seed_addresses:
-                config = peer_cache_config(config, is_draft=is_draft)
             for local_rank, global_rank in enumerate(local_ranks):
                 offset = port_offset + global_rank
                 source = seed_address(
@@ -442,6 +446,7 @@ class PreloadSubcommand(CLISubcommand):
                     ),
                     source=source,
                     token=args.seed_token,
+                    seed_weights=bool(seed_addresses),
                 )
                 proc: BaseProcess = ctx.Process(
                     target=_run_daemon,

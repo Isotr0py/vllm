@@ -8,6 +8,7 @@ See `docs/features/preload.md` for deployment examples.
 """
 
 import contextlib
+import copy
 import gc
 import multiprocessing
 from collections.abc import Iterable
@@ -55,7 +56,7 @@ from vllm.model_executor.model_loader.weight_cache.warmup_cache.flashinfer_autot
     FlashInferWarmupCache,
 )
 from vllm.model_executor.model_loader.weight_cache.weight_seed.loader import (
-    PeerModelLoader,
+    load_peer_model,
 )
 from vllm.model_executor.model_loader.weight_cache.weight_seed.seed import (
     WeightShardSeed,
@@ -68,7 +69,7 @@ from vllm.utils.mem_utils import format_gib
 from vllm.utils.torch_utils import set_default_torch_dtype
 from vllm.v1.worker.workspace import init_workspace_manager
 
-logger = init_logger("vllm.model_executor.model_loader.weight_cache.daemon")
+logger = init_logger(__name__)
 
 
 class WeightCacheDaemon:
@@ -98,18 +99,19 @@ class WeightCacheDaemon:
         )
         self.world_size = parallel_config.data_parallel_size * ranks_per_dp
         dp_rank, rank_in_dp = divmod(global_rank, ranks_per_dp)
+        # Per-rank caches and expert placement follow the engine worker's rank.
+        parallel_updates: dict[str, int] = {"rank": rank_in_dp}
         if parallel_config.data_parallel_size > 1:
             # The engine sets these on each DP rank's workers; the MoE/EP
             # layers read them to place their expert shards.
             start_dp_rank = (global_rank - local_rank) // ranks_per_dp
-            parallel_config = replace(
-                parallel_config,
+            parallel_updates.update(
                 data_parallel_rank=dp_rank,
                 data_parallel_rank_local=dp_rank - start_dp_rank,
             )
-            vllm_config = replace(vllm_config, parallel_config=parallel_config)
-        # Per-rank caches and expert placement follow the engine worker's rank.
-        vllm_config.parallel_config.rank = rank_in_dp
+        parallel_config = replace(parallel_config, **parallel_updates)
+        vllm_config = copy.copy(vllm_config)
+        vllm_config.parallel_config = parallel_config
         self.vllm_config = vllm_config
         # A draft daemon builds the draft with the target's VllmConfig, like
         # the engine does; only the ModelConfig differs.
@@ -276,7 +278,6 @@ class WeightCacheDaemon:
         vllm_config = self.vllm_config
         model_config = self.model_config
         load_config = vllm_config.load_config
-        loader = get_model_loader(load_config)
         device_config = vllm_config.device_config
         target_device = torch.device(
             device_config.device if load_config.device is None else load_config.device
@@ -284,10 +285,11 @@ class WeightCacheDaemon:
         # Attention backends may take workspace at construction, like in the
         # engine's worker init.
         init_workspace_manager(target_device)
-        if isinstance(loader, PeerModelLoader):
-            return loader.load_model(
+        if transport.seeds_weights:
+            return load_peer_model(
                 vllm_config, model_config, cache_key=self.cache_key, transport=transport
             )
+        loader = get_model_loader(load_config)
         with set_default_torch_dtype(model_config.dtype):
             with target_device:
                 model = loader.create_model(vllm_config, model_config)

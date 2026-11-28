@@ -41,7 +41,7 @@ class PeerIpcMover(WeightMover):
         # name the daemon's device; None means the device is already current
         # (e.g. the loader's own thread).
         self._device_index = device_index
-        self._ipc_backend = ipc_backend or TorchIPCBackend()
+        self._ipc_backend = ipc_backend
 
     def prepare_seed(self, storages: list["StorageRecord"]) -> dict:
         if self._device_index is not None:
@@ -50,6 +50,8 @@ class PeerIpcMover(WeightMover):
         gpu_uuid = None
         if torch.accelerator.device_count() > 0 and current_platform.is_cuda_alike():
             gpu_uuid = current_platform.get_device_uuid(index)
+        if self._ipc_backend is None:
+            self._ipc_backend = TorchIPCBackend()
         entries = [self._ipc_backend.export_storage(record) for record in storages]
         return {
             "backend": self.name,

@@ -1323,6 +1323,30 @@ def test_daemon_rejects_unmappable_parallelism(placement, message):
         plan_local_ranks(config)
 
 
+def test_validate_seed_args_rejects_whitespace_seed():
+    from types import SimpleNamespace
+
+    from vllm.entrypoints.cli.preload import _validate_seed_args
+
+    args = SimpleNamespace(
+        seed_listen_host=None,
+        seed_listen_port=None,
+        seed_source_host=None,
+        seed_source_port=None,
+        seed_token=None,
+        weight_cache_seed="   ",
+    )
+    with pytest.raises(ValueError, match="at least one address"):
+        _validate_seed_args(
+            args,
+            world_size=1,
+            num_groups=1,
+            nnodes=1,
+            local_world_size=1,
+            addresses=[],
+        )
+
+
 def test_daemon_keys_dense_dp_ranks_like_the_engine():
     """The engine runs non-MoE DP ranks as independent DP=1 replicas, so the
     daemon must fingerprint them the same way or no engine can map them."""
@@ -2143,7 +2167,6 @@ def _exercise_lease_shutdown(
         SeedTransport,
     )
     from vllm.model_executor.model_loader.weight_cache.weight_seed.core import (
-        acknowledge_lease,
         get_mover,
     )
 
@@ -2167,7 +2190,7 @@ def _exercise_lease_shutdown(
     )
     tensors = mover.fill(manifest, payload["seed"], device)
     assert len(tensors) == len(manifest["tensors"])
-    acknowledge_lease(transport)
+    transport.fetch("weights", acknowledge=True)
     assert source.wait_for_exit(timeout_s=30) == 128 + signal.SIGTERM
     return payload
 
@@ -2415,24 +2438,26 @@ def test_compile_cache_bundle_round_trip(tmp_path):
     from vllm.model_executor.model_loader.weight_cache.warmup_cache.common import (
         _bundle,
         _install,
-        _manifest,
     )
 
     source = tmp_path / "source"
     target = tmp_path / "target"
     (source / "nested").mkdir(parents=True)
     (source / "nested" / "kernel.cubin").write_bytes(b"compiled-kernel")
-    manifest = _manifest({"flashinfer-cubins": source})
-    bundle = _bundle({"flashinfer-cubins": source}, manifest)
+    bundle = _bundle({"flashinfer-cubins": source})
+    assert bundle is not None
 
-    _install(bundle, manifest, {"flashinfer-cubins": target})
+    _install(bundle, {"flashinfer-cubins": target})
 
     assert (target / "nested" / "kernel.cubin").read_bytes() == b"compiled-kernel"
 
 
-def test_compile_cache_manifest_deduplicates_nested_roots(tmp_path):
+def test_compile_cache_bundle_deduplicates_nested_roots(tmp_path):
+    import io
+    import tarfile
+
     from vllm.model_executor.model_loader.weight_cache.warmup_cache.common import (
-        _manifest,
+        _bundle,
     )
 
     workspace = tmp_path / "workspace"
@@ -2441,20 +2466,22 @@ def test_compile_cache_manifest_deduplicates_nested_roots(tmp_path):
     (workspace / "workspace.json").write_bytes(b"workspace")
     (cubins / "kernel.cubin").write_bytes(b"compiled-kernel")
 
-    manifest = _manifest(
+    bundle = _bundle(
         {
             "flashinfer-cubins": cubins,
             "flashinfer-workspace": workspace,
         }
     )
+    assert bundle is not None
 
-    assert [entry["path"] for entry in manifest["entries"]].count(
-        "cubins/kernel.cubin"
-    ) == 0
-    assert len(manifest["entries"]) == 2
+    with tarfile.open(fileobj=io.BytesIO(bundle), mode="r:") as archive:
+        assert archive.getnames() == [
+            "flashinfer-cubins/kernel.cubin",
+            "flashinfer-workspace/workspace.json",
+        ]
 
 
-def test_compile_cache_manifest_rejects_path_traversal():
+def test_compile_cache_rejects_path_traversal():
     from vllm.model_executor.model_loader.weight_cache.warmup_cache.common import (
         _safe_path,
     )
@@ -2472,19 +2499,7 @@ def test_compile_cache_payload_rejects_oversized_bundle():
     )
 
     payload = {
-        "manifest": {
-            "version": 1,
-            "total_size": 1,
-            "entries": [
-                {
-                    "root": "flashinfer-cubins",
-                    "path": "kernel.cubin",
-                    "size": 1,
-                    "sha256": "0" * 64,
-                    "mtime_ns": 0,
-                }
-            ],
-        },
+        "version": 1,
         "key": artifact_key("compile_cache", "0" * 64, "bundle.tar"),
         "bundle_size": BUNDLE_LIMIT + 1,
         "sha256": "0" * 64,

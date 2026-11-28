@@ -47,6 +47,24 @@ class ArtifactStore(Protocol):
         ...
 
 
+def atomic_write_bytes(path: Path, data: bytes, *, mtime_ns: int | None = None) -> None:
+    """Atomically write bytes to `path` via a unique temp file in its directory."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(
+        dir=path.parent, suffix=".tmp", prefix=f".{path.name}."
+    )
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+        if mtime_ns is not None:
+            os.utime(tmp_path, ns=(mtime_ns, mtime_ns))
+        os.replace(tmp_path, path)
+    except BaseException:
+        with suppress(OSError):
+            os.unlink(tmp_path)
+        raise
+
+
 class DiskArtifactStore(ArtifactStore):
     """The local disk store: one directory tree per warmup-cache kind."""
 
@@ -68,19 +86,7 @@ class DiskArtifactStore(ArtifactStore):
         return path.read_bytes() if path.is_file() else None
 
     def put(self, key: str, data: bytes) -> None:
-        path = self._path(key)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        fd, tmp_path = tempfile.mkstemp(
-            dir=path.parent, suffix=".tmp", prefix=f".{path.name}."
-        )
-        try:
-            with os.fdopen(fd, "wb") as f:
-                f.write(data)
-            os.replace(tmp_path, path)
-        except BaseException:
-            with suppress(OSError):
-                os.unlink(tmp_path)
-            raise
+        atomic_write_bytes(self._path(key), data)
 
 
 class MooncakeArtifactStore(ArtifactStore):

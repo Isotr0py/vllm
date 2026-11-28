@@ -3,8 +3,10 @@
 """Compiled runtime artifact warmup cache."""
 
 import hashlib
+import os
 import time
 from collections.abc import Iterable
+from pathlib import Path
 from typing import Any
 
 from vllm.logger import init_logger
@@ -20,12 +22,21 @@ from vllm.model_executor.model_loader.weight_cache.transport import (
 from vllm.model_executor.model_loader.weight_cache.warmup_cache.common import (
     BUNDLE_LIMIT,
     _bundle,
-    _cache_roots,
     _install,
-    _manifest,
 )
 
 logger = init_logger(__name__)
+
+
+def _cache_roots() -> dict[str, Path]:
+    return {
+        name: Path(value).expanduser()
+        for name, variable in (
+            ("flashinfer-cubins", "FLASHINFER_CUBIN_DIR"),
+            ("flashinfer-workspace", "FLASHINFER_WORKSPACE_BASE"),
+        )
+        if (value := os.environ.get(variable))
+    }
 
 
 class CompileArtifactWarmupCache(Seedable):
@@ -81,10 +92,9 @@ class CompileArtifactWarmupCache(Seedable):
         if not stores:
             return
         try:
-            manifest = _manifest(self.roots)
-            if not manifest["entries"]:
+            bundle = _bundle(self.roots)
+            if bundle is None:
                 return
-            bundle = _bundle(self.roots, manifest)
             digest = hashlib.sha256(bundle).hexdigest()
             key = artifact_key(self.kind, digest, "bundle.tar")
             for store in stores:
@@ -95,7 +105,7 @@ class CompileArtifactWarmupCache(Seedable):
             )
             return
         self._payload = {
-            "manifest": manifest,
+            "version": 1,
             "key": key,
             "bundle_size": len(bundle),
             "sha256": digest,
@@ -107,29 +117,22 @@ class CompileArtifactWarmupCache(Seedable):
         return self._payload
 
     def validate_payload(self, payload: Any) -> dict[str, Any]:
-        if not isinstance(payload, dict):
-            raise ValueError("compile cache payload must be an object")
-        manifest = payload.get("manifest")
-        if not isinstance(manifest, dict) or manifest.get("version") != 1:
-            raise ValueError("malformed compiled cache manifest")
-        if manifest["total_size"] > BUNDLE_LIMIT:
-            raise ValueError("compiled cache manifest is too large")
+        if not isinstance(payload, dict) or payload.get("version") != 1:
+            raise ValueError("invalid compile cache descriptor")
         size = payload.get("bundle_size")
         key, digest = payload.get("key"), payload.get("sha256")
-        if isinstance(size, int) and size > BUNDLE_LIMIT:
+        if isinstance(size, int) and not isinstance(size, bool) and size > BUNDLE_LIMIT:
             raise ValueError("compiled cache bundle is too large")
         if (
-            not manifest["entries"]
-            or not isinstance(size, int)
+            not isinstance(size, int)
+            or isinstance(size, bool)
             or size <= 0
             or not isinstance(digest, str)
             or key != artifact_key(self.kind, digest, "bundle.tar")
-            or sum(entry["size"] for entry in manifest["entries"])
-            != manifest["total_size"]
         ):
             raise ValueError("invalid compile cache descriptor")
         return {
-            "manifest": manifest,
+            "version": 1,
             "key": key,
             "bundle_size": size,
             "sha256": digest,
@@ -144,6 +147,6 @@ class CompileArtifactWarmupCache(Seedable):
                 raise ValueError("compiled cache bundle size mismatch")
             if hashlib.sha256(bundle).hexdigest() != payload["sha256"]:
                 raise ValueError("compiled cache bundle checksum mismatch")
-            _install(bundle, payload["manifest"], self.roots)
+            _install(bundle, self.roots)
             return
         raise RuntimeError("compiled cache bundle is missing from every shared store")

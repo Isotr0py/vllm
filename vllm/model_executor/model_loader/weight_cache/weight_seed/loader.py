@@ -3,15 +3,12 @@
 """Fill a daemon's model with a source replica's post-processed weights."""
 
 import contextlib
-from copy import copy
 
 import torch
 import torch.nn as nn
 
 from vllm.config import ModelConfig, VllmConfig
-from vllm.config.load import LoadConfig
 from vllm.logger import init_logger
-from vllm.model_executor.model_loader.base_loader import BaseModelLoader
 from vllm.model_executor.model_loader.utils import (
     build_model_from_processed_weights,
 )
@@ -23,7 +20,6 @@ from vllm.model_executor.model_loader.weight_cache.transport import SeedTranspor
 from vllm.model_executor.model_loader.weight_cache.weight_seed.core import (
     MOONCAKE_BACKEND,
     PEER_IPC_BACKEND,
-    acknowledge_lease,
     get_mover,
 )
 from vllm.model_executor.model_loader.weight_cache.weight_seed.utils import (
@@ -35,70 +31,49 @@ from vllm.tracing import instrument
 logger = init_logger(__name__)
 
 
-class PeerModelLoader(BaseModelLoader):
-    """Loads a daemon's model from a source replica's weight cache daemon."""
-
-    def __init__(self, load_config: LoadConfig):
-        super().__init__(load_config)
-        extra_config = copy(load_config.model_loader_extra_config or {})
-        self.is_draft = bool(extra_config.pop("is_draft", False))
-        if extra_config:
-            raise ValueError(
-                f"Unexpected extra config keys for load format "
-                f"{load_config.load_format}: {sorted(extra_config)}"
-            )
-
-    def download_model(self, model_config: ModelConfig) -> None:
-        return None
-
-    def load_weights(self, model: nn.Module, model_config: ModelConfig) -> None:
-        raise NotImplementedError(
-            "Standalone weight reload is not supported for load format 'peer_cache' yet"
-        )
-
-    @instrument(span_name="Load model")
-    def load_model(
-        self,
-        vllm_config: VllmConfig,
-        model_config: ModelConfig,
-        prefix: str = "",
-        *,
-        cache_key: WeightCacheKey,
-        transport: SeedTransport,
-    ) -> nn.Module:
-        check_weight_cache_loader_support(
-            vllm_config, model_config, is_draft=self.is_draft
-        )
-        backend = (
-            PEER_IPC_BACKEND if isinstance(transport.source, str) else MOONCAKE_BACKEND
-        )
-        raw = transport.fetch("weights", seed_backend=backend)
-        try:
-            payload = validate_weights_payload(raw, cache_key, model_config.model)
-        except Exception:
-            with contextlib.suppress(Exception):
-                acknowledge_lease(transport)
-            raise
-        manifest = payload["manifest"]
+@instrument(span_name="Load model")
+def load_peer_model(
+    vllm_config: VllmConfig,
+    model_config: ModelConfig,
+    prefix: str = "",
+    *,
+    cache_key: WeightCacheKey,
+    transport: SeedTransport,
+) -> nn.Module:
+    """Load a daemon's model from a source replica's weight cache daemon."""
+    check_weight_cache_loader_support(
+        vllm_config, model_config, is_draft=cache_key.is_draft
+    )
+    backend = (
+        PEER_IPC_BACKEND if isinstance(transport.source, str) else MOONCAKE_BACKEND
+    )
+    raw = transport.fetch("weights", seed_backend=backend)
+    try:
+        payload = validate_weights_payload(raw, cache_key, model_config.model)
         mover = get_mover(payload["seed"]["backend"])
-        device = torch.device(
-            current_platform.device_type, torch.accelerator.current_device_index()
-        )
-        tensors = mover.fill(manifest, payload["seed"], device)
-        acknowledge_lease(transport)
-        model = build_model_from_processed_weights(
-            vllm_config,
-            model_config,
-            prefix,
-            tensors,
-            manifest,
-            aliases=dict(payload["aliases"]),
-            attrs=dict(payload["attrs"]),
-            load_config=self.load_config,
-        )
-        logger.info(
-            "Loaded %d tensors from a peer daemon over %s",
-            len(tensors),
-            payload["seed"]["backend"],
-        )
-        return model
+    except Exception:
+        with contextlib.suppress(Exception):
+            transport.fetch("weights", acknowledge=True)
+        raise
+    manifest = payload["manifest"]
+    device = torch.device(
+        current_platform.device_type, torch.accelerator.current_device_index()
+    )
+    tensors = mover.fill(manifest, payload["seed"], device)
+    transport.fetch("weights", acknowledge=True)
+    model = build_model_from_processed_weights(
+        vllm_config,
+        model_config,
+        prefix,
+        tensors,
+        manifest,
+        aliases=dict(payload["aliases"]),
+        attrs=dict(payload["attrs"]),
+        load_config=vllm_config.load_config,
+    )
+    logger.info(
+        "Loaded %d tensors from a peer daemon over %s",
+        len(tensors),
+        payload["seed"]["backend"],
+    )
+    return model

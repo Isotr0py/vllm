@@ -96,11 +96,6 @@ def format_daemon_role(is_draft: bool) -> DaemonRole:
     return "draft" if is_draft else "target"
 
 
-def format_socket_role_suffix(is_draft: bool) -> str:
-    """Socket-name suffix keeping the draft group distinct from the target."""
-    return "_draft" if is_draft else ""
-
-
 def get_engine_dp_placement(vllm_config: VllmConfig, dp_rank: int) -> tuple[int, int]:
     """`(dp_size, dp_rank)` as the engine fingerprints this DP rank.
 
@@ -202,7 +197,7 @@ def collect_tensors(
     return tensors, kinds, aliases
 
 
-def exported_weight_bytes(storages: Iterable["StorageRecord"] | None) -> int:
+def exported_weight_bytes(storages: Iterable["StorageRecord"]) -> int:
     """Allocation bytes of unique non-CPU storages mapped from cached state.
 
     This is the memory the engine would otherwise allocate for the weights
@@ -211,8 +206,6 @@ def exported_weight_bytes(storages: Iterable["StorageRecord"] | None) -> int:
     parameters/buffers that the engine rebuilds itself), so reporting it
     would shrink the engine's KV cache below that of a disk load.
     """
-    if storages is None:
-        return 0
     allocations = {
         (record.storage.device, record.storage.data_ptr()): record.storage
         for record in storages

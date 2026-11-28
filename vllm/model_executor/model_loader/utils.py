@@ -58,10 +58,7 @@ def get_draft_load_config(vllm_config: VllmConfig) -> LoadConfig:
     ):
         return speculative_config.draft_load_config
     load_config = vllm_config.load_config
-    if load_config is not None and load_config.load_format not in (
-        "ipc_cache",
-        "peer_cache",
-    ):
+    if load_config is not None and load_config.load_format != "ipc_cache":
         return load_config
     kwargs = (
         # Route the draft to the daemon's draft group.

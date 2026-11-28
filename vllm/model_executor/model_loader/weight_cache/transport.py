@@ -34,9 +34,9 @@ from vllm.model_executor.model_loader.weight_cache.ipc_backends.serial_utils imp
 )
 from vllm.model_executor.model_loader.weight_cache.protocol import (
     WeightCacheUnavailableError,
+    connect_local_socket,
     recv_json,
     send_json,
-    verify_socket_owner,
 )
 
 logger = init_logger(__name__)
@@ -76,6 +76,7 @@ class SeedConfig(NamedTuple):
     listen: tuple[str, int] | None = None
     source: str | tuple[str, int] | None = None
     token: str | None = None
+    seed_weights: bool = False
 
 
 class SeedTransport:
@@ -83,7 +84,7 @@ class SeedTransport:
 
     def __init__(self, seed_config: SeedConfig | None = None):
         seed_config = seed_config or SeedConfig()
-        listen, source, token = seed_config
+        listen, source, token, _ = seed_config
         remote_source = source is not None and not isinstance(source, str)
         if (listen is not None or remote_source) and not token:
             raise ValueError("A daemon-to-daemon listener/source requires a token")
@@ -112,6 +113,10 @@ class SeedTransport:
     @property
     def listens(self) -> bool:
         return self._seed_config.listen is not None
+
+    @property
+    def seeds_weights(self) -> bool:
+        return self._seed_config.seed_weights
 
     def handle_request(self, request: Any, *, remote: bool = False) -> dict[str, Any]:
         """Source side: answer one request; remote=True applies validate_remote."""
@@ -166,10 +171,7 @@ class SeedTransport:
 
     def _request_local(self, path: str, payload: dict[str, Any]) -> Any:
         """Fetch over the source's owner-verified Unix socket (pickle)."""
-        verify_socket_owner(path, strict_perms=False)
-        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
-            sock.settimeout(_REQUEST_TIMEOUT_S)
-            sock.connect(path)
+        with connect_local_socket(path, _REQUEST_TIMEOUT_S) as sock:
             # Authenticated by ownership: seed handlers may be slow.
             sock.settimeout(_AUTHENTICATED_TIMEOUT_S)
             send_msg(sock, {"cmd": "seed", **payload})
