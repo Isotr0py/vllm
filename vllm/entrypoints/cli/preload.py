@@ -30,8 +30,7 @@ import sys
 import threading
 import time
 import typing
-from collections.abc import Sequence
-from itertools import product
+from collections.abc import Collection
 from multiprocessing.connection import wait
 from multiprocessing.process import BaseProcess
 
@@ -65,20 +64,18 @@ logger = init_logger(__name__)
 
 
 class _HealthState:
-    def __init__(self, processes: Sequence[BaseProcess]) -> None:
+    def __init__(self, processes: Collection[BaseProcess]) -> None:
         self.processes = processes
-        self._ready = False
-        self._lock = threading.Lock()
+        self._ready = threading.Event()
 
     def mark_ready(self) -> None:
-        with self._lock:
-            self._ready = True
+        self._ready.set()
 
     @property
     def is_ready(self) -> bool:
-        with self._lock:
-            ready = self._ready
-        return ready and not any(proc.exitcode is not None for proc in self.processes)
+        return self._ready.is_set() and all(
+            proc.exitcode is None for proc in self.processes
+        )
 
 
 def _build_health_app(state: _HealthState) -> FastAPI:
@@ -133,6 +130,8 @@ def _validate_seed_args(
         raise ValueError(
             "--weight-cache-seed conflicts with --seed-source-host/--seed-source-port"
         )
+    if args.weight_cache_seed is not None and not addresses:
+        raise ValueError("--weight-cache-seed must specify at least one address")
     unix_seed = any(isinstance(address, str) for address in addresses)
     remote_seed = any(not isinstance(address, str) for address in addresses)
     if unix_seed and remote_seed:
@@ -293,7 +292,6 @@ class PreloadSubcommand(CLISubcommand):
     def cmd(args: argparse.Namespace) -> None:
         # Imported here so `vllm --help` and friends stay free of torch.
         from vllm.model_executor.model_loader.weight_cache.daemon import (
-            _reject_unsupported_parallelism,
             _run_daemon,
             daemon_serves_model,
             get_draft_daemon_config,
@@ -327,36 +325,37 @@ class PreloadSubcommand(CLISubcommand):
         # WeightCacheDaemon.get_model.
         check_ipc_platform_support()
         parallel_config = vllm_config.parallel_config
-        _reject_unsupported_parallelism(parallel_config)
         tp_size = parallel_config.tensor_parallel_size
         pp_size = parallel_config.pipeline_parallel_size
         dp_size = parallel_config.data_parallel_size
         world_size = dp_size * pp_size * tp_size
 
-        placements = plan_local_ranks(parallel_config)
-        local_world_size = len(placements)
-        if dp_size == 1:
-            nnodes = parallel_config.nnodes
-            node_rank = parallel_config.node_rank
-            master_addr = parallel_config.master_addr
-        else:
+        local_ranks = plan_local_ranks(parallel_config)
+        local_world_size = len(local_ranks)
+        nnodes = parallel_config.nnodes
+        node_rank = parallel_config.node_rank
+        master_addr = parallel_config.master_addr
+        if dp_size > 1:
             master_addr = parallel_config.data_parallel_master_ip
-            if parallel_config.nnodes > 1:
-                nnodes = parallel_config.nnodes
-                node_rank = parallel_config.node_rank
-            else:
-                nnodes = dp_size // parallel_config.data_parallel_size_local
-                node_rank = parallel_config.data_parallel_rank // (
-                    parallel_config.data_parallel_size_local
-                )
+            if nnodes == 1:
+                local_dp = parallel_config.data_parallel_size_local
+                first_dp = parallel_config.data_parallel_rank
+                if dp_size % local_dp != 0 or first_dp % local_dp != 0:
+                    raise ValueError(
+                        f"--data-parallel-size-local ({local_dp}) must evenly divide "
+                        f"--data-parallel-size ({dp_size}) and "
+                        f"--data-parallel-start-rank ({first_dp})"
+                    )
+                nnodes = dp_size // local_dp
+                node_rank = first_dp // local_dp
             if nnodes > 1 and master_addr in ("127.0.0.1", "localhost"):
                 raise ValueError(
                     "Data parallelism across nodes requires a reachable "
                     "--data-parallel-address for the daemon rendezvous"
                 )
 
-        # The daemon forms its own world group and holds it open while
-        # serving, so it needs a rendezvous port distinct from the engine's.
+        # The daemon forms its own world group during startup, so it needs
+        # a rendezvous port distinct from the engine's.
         # All nodes must agree on it; single-node can auto-pick a free port.
         # The master address is the engine's --master-addr (TP across nodes)
         # or --data-parallel-address.
@@ -391,17 +390,6 @@ class PreloadSubcommand(CLISubcommand):
 
         ctx = multiprocessing.get_context("spawn")
         ready_queue: multiprocessing.Queue[tuple[str, int]] = ctx.Queue()
-        # Local index == device index; global rank enumerates DP, PP, then TP.
-        expected_ready = {
-            (
-                format_daemon_role(is_draft),
-                dp_rank * pp_size * tp_size + pp_rank * tp_size + tp_rank,
-            )
-            for (is_draft, _, _), (_, dp_rank, pp_rank, tp_rank) in product(
-                groups, placements
-            )
-            if daemon_serves_model(is_draft, pp_rank, pp_size)
-        }
         seed_addresses = parse_seed_addresses(args.weight_cache_seed)
         _validate_seed_args(
             args,
@@ -425,24 +413,26 @@ class PreloadSubcommand(CLISubcommand):
                 return None
             return host, base_port + offset
 
-        mirror_devices = None
+        device_indices: range | list[int] = range(local_world_size)
         if seed_addresses and all(
             isinstance(address, str) for address in seed_addresses
         ):
             # Same-host mirror: place every local daemon on a GPU the
             # source replica does not use, inferred from the source's GPUs.
-            mirror_devices = mirror_device_indices(seed_addresses, local_world_size)
+            device_indices = mirror_device_indices(seed_addresses, local_world_size)
 
         procs: list[BaseProcess] = []
-        serving: list[BaseProcess] = []
+        serving: dict[BaseProcess, tuple[str, int]] = {}
         for group_index, (is_draft, config, init_method) in enumerate(groups):
             # Draft daemons live past the target group's port block at every
             # source node.
             port_offset = group_index * world_size
-            for local_rank, dp_rank, pp_rank, tp_rank in placements:
-                global_rank = dp_rank * pp_size * tp_size + pp_rank * tp_size + tp_rank
+            role = format_daemon_role(is_draft)
+            if seed_addresses:
+                config = peer_cache_config(config, is_draft=is_draft)
+            for local_rank, global_rank in enumerate(local_ranks):
                 offset = port_offset + global_rank
-                peer_source = seed_address(
+                source = seed_address(
                     seed_addresses,
                     local_rank,
                     global_rank,
@@ -450,15 +440,7 @@ class PreloadSubcommand(CLISubcommand):
                     node_rank=node_rank,
                     is_draft=is_draft,
                 )
-                source: str | tuple[str, int] | None
-                if peer_source is not None:
-                    daemon_config = peer_cache_config(config, is_draft=is_draft)
-                    # The mirror also adopts the source's warmup caches (the
-                    # FlashInfer autotune table) from the same address
-                    # through the ordinary warmup-cache seeding path.
-                    source = peer_source
-                else:
-                    daemon_config = config
+                if source is None:
                     source = _seed_endpoint(
                         args.seed_source_host, args.seed_source_port, offset
                     )
@@ -469,34 +451,28 @@ class PreloadSubcommand(CLISubcommand):
                     source=source,
                     token=args.seed_token,
                 )
-                procs.append(
-                    ctx.Process(
-                        target=_run_daemon,
-                        args=(
-                            global_rank,
-                            local_rank,
-                            daemon_config,
-                            init_method,
-                            args.weight_cache_socket_dir,
-                            ready_queue,
-                            is_draft,
-                            dp_rank,
-                            pp_rank,
-                            seed_config,
-                            mirror_devices[local_rank]
-                            if mirror_devices is not None
-                            else None,
-                            warmup_cache_stores,
-                            args.weight_cache_backend,
-                        ),
-                        name=(
-                            f"vllm-weight-cache-{format_daemon_role(is_draft)}-"
-                            f"{global_rank}"
-                        ),
-                    )
+                proc: BaseProcess = ctx.Process(
+                    target=_run_daemon,
+                    args=(
+                        global_rank,
+                        local_rank,
+                        config,
+                        init_method,
+                        args.weight_cache_socket_dir,
+                        ready_queue,
+                    ),
+                    kwargs=dict(
+                        is_draft=is_draft,
+                        seed_config=seed_config,
+                        device_index=device_indices[local_rank],
+                        warmup_cache_stores=warmup_cache_stores,
+                        weight_cache_backend=args.weight_cache_backend,
+                    ),
+                    name=f"vllm-weight-cache-{role}-{global_rank}",
                 )
-                if daemon_serves_model(is_draft, pp_rank, pp_size):
-                    serving.append(procs[-1])
+                procs.append(proc)
+                if daemon_serves_model(is_draft, global_rank, parallel_config):
+                    serving[proc] = (role, global_rank)
         health_state = _HealthState(serving)
         health_server = None
         health_thread = None
@@ -525,7 +501,7 @@ class PreloadSubcommand(CLISubcommand):
                 proc.start()
                 started.append(proc)
 
-            ready: set[tuple[str, int]] = set()
+            pending = set(serving.values())
             while not shutdown_requested:
                 # Daemons that serve no model exit cleanly after the rendezvous.
                 dead = [
@@ -537,7 +513,7 @@ class PreloadSubcommand(CLISubcommand):
                     logger.error(
                         "Weight cache daemon rank(s) exited during %s "
                         "(exitcodes=%s); shutting down.",
-                        "serving" if ready == expected_ready else "startup",
+                        "startup" if pending else "serving",
                         [p.exitcode for p in dead],
                     )
                     # Preserve the failure before terminating healthy siblings.
@@ -545,14 +521,14 @@ class PreloadSubcommand(CLISubcommand):
                     failure = next((code for p in dead if (code := p.exitcode)), 1)
                     exit_code = 128 - failure if failure < 0 else failure
                     break
-                if ready == expected_ready:
+                if not pending:
                     wait([p.sentinel for p in serving], timeout=1.0)
                     continue
                 try:
-                    ready.add(ready_queue.get(timeout=1.0))
+                    pending.discard(ready_queue.get(timeout=1.0))
                 except queue.Empty:
                     continue
-                if ready == expected_ready:
+                if not pending:
                     health_state.mark_ready()
                     socket_dir_msg = (
                         args.weight_cache_socket_dir or "the default socket dir"
@@ -562,7 +538,7 @@ class PreloadSubcommand(CLISubcommand):
                         "daemon(s) in %s =====",
                         node_rank,
                         nnodes,
-                        len(expected_ready),
+                        len(serving),
                         socket_dir_msg,
                     )
         finally:
